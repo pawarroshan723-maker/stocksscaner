@@ -137,3 +137,43 @@ def test_exports_produce_parseable_files(mod, scanned, tmp_path):
     assert body.rstrip().endswith("</html>")
     # no raw un-escaped script from a note
     assert "<script>alert" not in body
+
+
+@pytest.fixture
+def wired_menu(mod, monkeypatch):
+    """Menu-driving fixture with the fake API installed but no scan run."""
+    api = FakeUpstox(daily=make_daily_series(n=400, seed=7))
+    api.intraday = {("days", "1"): make_daily_series(n=2, seed=7).tail(1)}
+    monkeypatch.setattr(mod, "requests", api)
+    syms = list(mod.SYMBOL_MAP.keys())[:3]
+    monkeypatch.setattr(mod, "ACTIVE_KEYS", syms)
+    monkeypatch.setattr(mod, "SYMBOL_MAP", {k: mod.SYMBOL_MAP[k] for k in syms})
+    monkeypatch.setattr(mod, "input", lambda prompt="": "", raising=False)
+    data = {}
+    for name in mod.SYMBOL_MAP.values():
+        mod.ensure_symbol(data, name)
+    return data
+
+
+def test_every_menu_option_with_empty_data(mod, wired_menu):
+    """The same walk, but before any scan has ever run.
+
+    A fresh install has rows for every symbol with NONE signals and zero
+    prices — a different code path from "has data" (divisions by zero, empty
+    max()/min(), sorted() over nothing) and the one a new user actually hits.
+    """
+    out = _walk(mod, wired_menu, MENU + ["0"])
+    assert "Traceback" not in out
+
+
+def test_every_menu_option_with_corrupt_entry(mod, wired_menu):
+    """A hand-edited/legacy row must not take a whole screen down."""
+    first = sorted(wired_menu)[0]
+    bad = mod.empty_entry()
+    bad.update({"price": "not-a-number", "rsi": None, "volume": [1, 2],
+                "targets": "oops", "52w": 7, "candle_patterns": {},
+                "signal": 42, "trend_strength": "strong"})
+    wired_menu[first]["DAY"] = bad
+    wired_menu[first]["WEEK"] = "totally-corrupt"
+    out = _walk(mod, wired_menu, MENU + ["0"])
+    assert "Traceback" not in out

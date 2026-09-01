@@ -10,7 +10,7 @@ from datetime import date, timedelta
 import pandas as pd
 import pytest
 
-from tests.fake_upstox import FakeUpstox, make_daily_series
+from tests.fake_upstox import FakeUpstox, make_daily_series, today_ist
 
 KEY = "NSE_EQ|INE002A01018"
 ENC = "NSE_EQ%7CINE002A01018"
@@ -81,7 +81,7 @@ def test_to_date_is_never_today_or_future(mod, api):
     mod.fetch_historical(KEY, "days", "1", 400, {}, verbose=False)
     for u in _hist_urls(api):
         to_d = date.fromisoformat(u.rsplit("/", 2)[-2])
-        assert to_d < date.today()
+        assert to_d < today_ist()
 
 
 # ── chunking ─────────────────────────────────────────────────
@@ -248,7 +248,7 @@ def test_cache_incremental_fill_only_downloads_gap(mod, api):
                                 cache_tf="DAY")
     n1 = len(_hist_urls(api))
     # extend the ground truth forward by 40 business days
-    extra = make_daily_series(n=40, end=date.today() - timedelta(days=1), seed=99)
+    extra = make_daily_series(n=40, end=today_ist() - timedelta(days=1), seed=99)
     api.daily = extra
     mod.fetch_historical_cached(KEY, "days", "1", 2500, {}, verbose=False,
                                 cache_tf="DAY")
@@ -263,7 +263,7 @@ def test_daily_series_has_no_missing_business_days(mod, api, monkeypatch):
     'not yet settled') while the live intraday call only returns today's bar,
     leaving a permanent one-day hole in the EMA/RSI/ATR inputs.
     """
-    today = date.today()
+    today = today_ist()
     hist = make_daily_series(n=200, end=today - timedelta(days=1), seed=5)
     api.daily = hist
     live = pd.DataFrame({
@@ -280,7 +280,7 @@ def test_daily_series_has_no_missing_business_days(mod, api, monkeypatch):
 
 
 def test_live_bar_is_never_written_to_cache(mod, api):
-    today = date.today()
+    today = today_ist()
     api.daily = make_daily_series(n=200, end=today - timedelta(days=1))
     live = pd.DataFrame({
         "ts": [pd.Timestamp(today).tz_localize("Asia/Kolkata")],
@@ -314,3 +314,69 @@ def test_api_calls_are_rate_limited(mod, api, monkeypatch):
     for _ in range(6):
         mod.fetch_historical(KEY, "days", "1", 300, {}, verbose=False)
     assert slept, "expected throttling sleeps between API calls"
+
+
+# ── IST clock & NSE holiday calendar ────────────────────────
+def test_today_ist_matches_the_scanner_clock(mod):
+    """_today_ist() must resolve against Asia/Kolkata, not the host zone.
+
+    Regression: the codebase used date.today(), so on any machine set to a
+    zone behind IST the scanner was a day out for most of the trading day.
+    """
+    import datetime as _dt
+    expected = _dt.datetime.now(
+        _dt.timezone(_dt.timedelta(hours=5, minutes=30))).date()
+    assert mod._today_ist() == expected
+    assert mod._today_ist() != _dt.date.today() or True   # never compare to local
+
+
+def test_last_trading_day_skips_weekends_and_holidays(mod):
+    # 2026-10-02 is Gandhi Jayanti (Friday) and 2026-10-20 is Dussehra (Tuesday).
+    for holiday in (mod.date(2026, 10, 2), mod.date(2026, 10, 20)):
+        assert holiday in mod.NSE_HOLIDAYS
+        stepped = mod._last_trading_day(holiday)
+        assert stepped < holiday, "must step back off a holiday"
+        assert mod._is_trading_day(stepped)
+
+    # a Saturday steps back to the preceding Friday
+    sat = mod.date(2026, 10, 3)
+    assert sat.weekday() == 5
+    assert mod._last_trading_day(sat) < sat
+    assert mod._last_trading_day(sat).weekday() < 5
+
+
+def test_next_trading_day_skips_weekends_and_holidays(mod):
+    # stepping forward off a holiday must not land on the holiday itself
+    d = mod._next_trading_day(mod.date(2026, 10, 2))
+    assert d > mod.date(2026, 10, 2)
+    assert mod._is_trading_day(d)
+    # and never on a weekend
+    assert mod._next_trading_day(mod.date(2026, 10, 3)).weekday() < 5
+
+
+def test_is_market_open_returns_false_on_a_holiday(mod, monkeypatch):
+    import datetime as _dt
+
+    class FrozenDT(_dt.datetime):
+        _when = _dt.datetime(2026, 10, 2, 11, 0, tzinfo=mod.IST)  # Gandhi Jayanti
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls._when if tz is None else cls._when.astimezone(tz)
+
+    monkeypatch.setattr(mod, "datetime", FrozenDT)
+    # 11:00 on a Friday is inside trading hours — only the holiday stops it.
+    assert mod._is_trading_day(_dt.date(2026, 10, 2)) is False
+    assert mod.is_market_open() is False
+
+
+def test_stale_holiday_calendar_warns(mod, monkeypatch, capsys):
+    """A year missing from NSE_HOLIDAYS must not pass silently."""
+    monkeypatch.setattr(mod, "_NSE_HOLIDAY_YEARS", {1970})
+    mod._warn_stale_holiday_calendar()
+    assert "NSE_HOLIDAYS" in capsys.readouterr().out
+
+    monkeypatch.setattr(mod, "_NSE_HOLIDAY_YEARS", {mod._today_ist().year})
+    capsys.readouterr()
+    mod._warn_stale_holiday_calendar()
+    assert capsys.readouterr().out == ""

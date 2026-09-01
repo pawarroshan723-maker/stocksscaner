@@ -5,14 +5,14 @@ Also includes a *mirror invariance* test: reflecting a price series about a
 horizontal line must flip every bull/bear verdict.  Any asymmetry between the
 bull and bear scoring paths shows up here.
 """
-from datetime import date, timedelta
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from tests.conftest import make_ohlcv
-from tests.fake_upstox import FakeUpstox, make_daily_series
+from tests.fake_upstox import FakeUpstox, make_daily_series, today_ist
 
 KEY = "NSE_EQ|INE002A01018"
 
@@ -212,7 +212,7 @@ def test_no_targets_when_atr_is_zero(mod, df_flat):
 
 # ── end-to-end scan ───────────────────────────────────────────
 def test_scan_populates_store_and_db(wired, api, monkeypatch):
-    today = date.today()
+    today = today_ist()
     api.daily = make_daily_series(n=400, end=today - timedelta(days=1), seed=21)
     live = pd.DataFrame({
         "ts": [pd.Timestamp(today).tz_localize("Asia/Kolkata")],
@@ -236,7 +236,7 @@ def test_scan_populates_store_and_db(wired, api, monkeypatch):
 
 
 def test_history_is_logged_for_signals(wired, api, monkeypatch):
-    today = date.today()
+    today = today_ist()
     api.daily = make_daily_series(n=400, end=today - timedelta(days=1), seed=3)
     api.intraday = {("days", "1"): pd.DataFrame({
         "ts": [pd.Timestamp(today).tz_localize("Asia/Kolkata")],
@@ -253,7 +253,7 @@ def test_history_is_logged_for_signals(wired, api, monkeypatch):
 
 
 def test_history_does_not_duplicate_identical_rows(wired, api, monkeypatch):
-    today = date.today()
+    today = today_ist()
     api.daily = make_daily_series(n=400, end=today - timedelta(days=1), seed=3)
     api.intraday = {("days", "1"): pd.DataFrame({
         "ts": [pd.Timestamp(today).tz_localize("Asia/Kolkata")],
@@ -269,7 +269,7 @@ def test_history_does_not_duplicate_identical_rows(wired, api, monkeypatch):
 
 
 def test_signal_change_detection(wired, api, monkeypatch):
-    today = date.today()
+    today = today_ist()
     api.daily = make_daily_series(n=400, end=today - timedelta(days=1), seed=3)
     api.intraday = {("days", "1"): pd.DataFrame({
         "ts": [pd.Timestamp(today).tz_localize("Asia/Kolkata")],
@@ -297,3 +297,55 @@ def test_rescanned_tf_does_not_leave_stale_entry(wired, api, monkeypatch):
     for sym in ("ALPHA", "BETA", "GAMMA"):
         assert data[sym]["DAY"]["price"] == 0
         assert data[sym]["DAY"]["signal"] == "NONE"
+
+
+# ── next-day gap score ──────────────────────────────────────
+def _gap_entry(mod, **over):
+    e = mod.empty_entry()
+    e.update({
+        "price": 100.0, "day_open": 99.0, "day_high": 110.0, "day_low": 90.0,
+        "rsi": 50.0, "rel_vol": 1.0, "trend_strength": 0,
+        "signal": "NONE", "ema_alignment": "", "52w": {},
+        "candle_patterns": [], "macd_hist_val": 0.0,
+    })
+    e.update(over)
+    return {"DAY": e}
+
+
+def test_gap_score_uses_real_close_position_not_trend_strength(mod):
+    """Factor 1 must read the day's OHLC, not trend_strength.
+
+    Regression: it read trend_strength — which factor 8 already scores — so
+    the label ("Close near High") was false and trend strength counted for
+    up to ±27 of the ±80 raw range instead of the documented ±7.
+    """
+    top = mod.calc_next_day_gap_score(_gap_entry(mod, price=109.0))
+    bot = mod.calc_next_day_gap_score(_gap_entry(mod, price=91.0))
+    mid = mod.calc_next_day_gap_score(_gap_entry(mod, price=100.0))
+    assert top[0] > mid[0] > bot[0], (top[0], mid[0], bot[0])
+
+    # trend_strength must not move factor 1 once real OHLC is available
+    flat_ts = mod.calc_next_day_gap_score(
+        _gap_entry(mod, price=109.0, trend_strength=-100))
+    assert flat_ts[0] > mid[0], "trend_strength must not override close position"
+
+
+def test_gap_score_falls_back_cleanly_without_ohlc(mod):
+    """Rows written before day_high/day_low existed must not crash or score 0."""
+    e = _gap_entry(mod, price=100.0)
+    del e["DAY"]["day_high"]
+    del e["DAY"]["day_low"]
+    score, bias, facts = mod.calc_next_day_gap_score(e)
+    assert 5 <= score <= 95
+    assert bias in ("GAP_UP", "NEUTRAL", "GAP_DOWN")
+    assert facts, "fallback still reports its factors"
+
+
+def test_gap_score_never_claims_certainty(mod):
+    for price in (90.0, 95.0, 100.0, 105.0, 110.0):
+        for ts in (-100, -50, 0, 50, 100):
+            score, bias, _ = mod.calc_next_day_gap_score(
+                _gap_entry(mod, price=price, trend_strength=ts,
+                           rsi=90.0, rel_vol=5.0))
+            assert 5 <= score <= 95, (price, ts, score)
+            assert bias in ("GAP_UP", "NEUTRAL", "GAP_DOWN")

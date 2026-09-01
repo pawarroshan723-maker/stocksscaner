@@ -166,3 +166,62 @@ def test_safe_float_is_total(mod):
         out = mod.safe_float(v, -9.0)
         assert isinstance(out, float)
         assert out == out          # never NaN (inf is allowed, NaN is not)
+
+
+# ── a whole TF entry that is not a dict ─────────────────────
+_NON_DICT = ["corrupt", 42, 3.14, None, [], True]
+
+
+def test_non_dict_tf_entry_does_not_crash_views(mod, capsys):
+    """sym_data[tf] comes from a JSON blob — it can be any JSON scalar.
+
+    Regression: view_detail / gather_alerts / conflict_status indexed it and
+    called .get() straight away, so one bad row took the whole screen down.
+    """
+    data = {"ALPHA": {"DAY": mod.empty_entry()}}
+    for bad in _NON_DICT:
+        d = {"ALPHA": {"DAY": mod.empty_entry(), "WEEK": bad}}
+        for fn in (lambda dd: mod.view_detail("ALPHA", dd),
+                   lambda dd: mod.gather_alerts("ALPHA", dd["ALPHA"]),
+                   lambda dd: mod.conflict_status(dd["ALPHA"]),
+                   lambda dd: mod.summary_view("ALPHA", dd),
+                   lambda dd: mod.generate_stock_summary("ALPHA", dd)):
+            try:
+                fn(d)
+            except Exception as exc:
+                pytest.fail("crashed on entry %r: %r" % (bad, exc))
+    capsys.readouterr()
+    assert isinstance(mod.as_dict(data["ALPHA"]["DAY"]), dict)
+
+
+def test_non_dict_tf_entry_does_not_crash_scanners(mod, capsys):
+    d = {"ALPHA": {"DAY": mod.empty_entry(), "WEEK": "oops"}}
+    try:
+        mod.alert_scanner(d, ["DAY", "WEEK"])
+        mod.dashboard(d, ["DAY", "WEEK"])
+        mod.filter_view(d, "BREAKOUT", ["DAY", "WEEK"])
+        mod.confluence_score(d["ALPHA"], ["DAY", "WEEK"])
+        mod.heatmap_view(d, ["DAY", "WEEK"])
+        mod.best_setups_view(d, ["DAY", "WEEK"])
+        mod.watchlist_view(d, ["DAY", "WEEK"])
+        mod.statistics_view(d)
+        mod.candle_pattern_view(d, ["DAY", "WEEK"])
+        mod.sector_view(d)
+        mod.export_csv(d, ["DAY", "WEEK"])
+        mod.export_report(d, ["DAY", "WEEK"])
+    except Exception as exc:
+        pytest.fail("scanner crashed on a non-dict TF entry: %r" % (exc,))
+    capsys.readouterr()
+
+
+def test_note_write_skips_non_dict_rows(mod, monkeypatch, capsys):
+    """edit_note must not TypeError when a TF entry is corrupt."""
+    data = {"ALPHA": {"DAY": mod.empty_entry(), "WEEK": "oops"}}
+    monkeypatch.setattr("builtins.input", lambda *a: "my note")
+    try:
+        mod.edit_note("ALPHA", data)
+    except Exception as exc:
+        pytest.fail("edit_note crashed: %r" % (exc,))
+    assert data["ALPHA"]["DAY"]["note"] == "my note"
+    assert data["ALPHA"]["WEEK"] == "oops"      # left alone, not clobbered
+    capsys.readouterr()

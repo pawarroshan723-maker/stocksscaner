@@ -17,12 +17,23 @@ queries against it, so tests can assert on chunking, gaps and cache behaviour.
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import unquote
 
 import pandas as pd
 
 IST_OFFSET = "+05:30"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def today_ist():
+    """Today's date in IST — the same clock the scanner uses.
+
+    The scanner resolves "today" against Asia/Kolkata, not the machine's local
+    zone. Tests must do the same or they drift a day out of step with it
+    whenever the host timezone is behind IST.
+    """
+    return datetime.now(IST).date()
 
 
 class FakeResponse:
@@ -124,7 +135,7 @@ def _to_candles(df):
 def make_daily_series(n=400, end=None, seed=3, start_price=1000.0, freq="B"):
     """Business-day OHLCV ending on `end` (a date), tz-aware IST."""
     import numpy as np
-    end = end or (date.today() - timedelta(days=1))
+    end = end or (today_ist() - timedelta(days=1))
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range(end=pd.Timestamp(end), periods=n)
     steps = rng.normal(0.05, 1.2, n)

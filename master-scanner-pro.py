@@ -127,36 +127,86 @@ IST            = pytz.timezone("Asia/Kolkata")
 MARKET_OPEN  = (9, 15)   # HH, MM
 MARKET_CLOSE = (15, 30)  # HH, MM
 
+# ── NSE TRADING HOLIDAYS ────────────────────────────────────
+# Equity-segment closures published by NSE. Without these the scanner treats
+# a holiday as a trading day: _last_trading_day() returns the holiday itself,
+# the historical call asks for a session that never happened, and every symbol
+# silently comes back with "no data" instead of stepping back to the real
+# last session.
+#
+# Add next year's list when NSE publishes it (usually December) — the scanner
+# warns at start-up if the current year is missing.
+NSE_HOLIDAYS = {
+    # 2026 (NSE circular CMTR71775; 15 Jan added by separate circular)
+    date(2026, 1, 15),   # Maharashtra municipal elections
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3, 3),    # Holi
+    date(2026, 3, 26),   # Shri Ram Navami
+    date(2026, 3, 31),   # Shri Mahavir Jayanti
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 5, 28),   # Bakri Id
+    date(2026, 6, 26),   # Muharram
+    date(2026, 9, 14),   # Ganesh Chaturthi
+    date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra
+    date(2026, 11, 10),  # Diwali - Balipratipada
+    date(2026, 11, 24),  # Prakash Gurpurb Sri Guru Nanak Dev
+    date(2026, 12, 25),  # Christmas
+}
+
+# Years NSE_HOLIDAYS actually covers. Used to warn on a stale calendar.
+_NSE_HOLIDAY_YEARS = {d.year for d in NSE_HOLIDAYS}
+
+
+def _today_ist():
+    """Today's date in IST.
+
+    Bug fix: the codebase used datetime.date.today(), which resolves against
+    the *machine's* local timezone. Every other clock here is IST, so on a
+    laptop set to (say) US Eastern the scanner was a day out for most of the
+    trading day: to_date pointed at a session the exchange had not reached,
+    and the daily cache believed T-1 was settled when it was not.
+    """
+    return datetime.now(IST).date()
+
+
+def _is_trading_day(d):
+    """Mon–Fri and not an NSE holiday."""
+    return d.weekday() < 5 and d not in NSE_HOLIDAYS
+
+
 def is_market_open():
     """Return True only during NSE trading hours (Mon–Fri, 09:15–15:30 IST)."""
     now = datetime.now(IST)
-    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+    if not _is_trading_day(now.date()):
         return False
     t = (now.hour, now.minute)
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 def _last_trading_day(d=None):
     """
-    Return the most recent Mon–Fri on or before date d.
-    Defaults to date.today() if d is None.
-    Used to ensure to_date in API calls never falls on a weekend.
+    Return the most recent NSE trading day on or before date d.
+    Defaults to today (IST) if d is None.
+    Used to ensure to_date in API calls never falls on a weekend or holiday.
     e.g. Monday→ steps back to Friday so Upstox minutes API doesn't get to_date=Sunday.
     """
     if d is None:
-        d = date.today()
-    while d.weekday() >= 5:          # 5 = Saturday, 6 = Sunday
+        d = _today_ist()
+    while not _is_trading_day(d):
         d -= timedelta(days=1)
     return d
 
 def _next_trading_day(d=None):
     """
-    Return the first Mon–Fri on or after date d.
-    Defaults to date.today() if d is None.
-    Used to ensure from_date in API calls never starts on a weekend.
+    Return the first NSE trading day on or after date d.
+    Defaults to today (IST) if d is None.
+    Used to ensure from_date in API calls never starts on a weekend or holiday.
     """
     if d is None:
-        d = date.today()
-    while d.weekday() >= 5:
+        d = _today_ist()
+    while not _is_trading_day(d):
         d += timedelta(days=1)
     return d
 
@@ -475,10 +525,13 @@ def resample_candles(df_day, freq, include_partial=True):
       vol   → sum of daily vol  (correct: total period activity)
       oi    → last day's OI     (correct: latest snapshot)
 
-    include_partial=True is safe because fetch_historical() sets
-    to_date=yesterday, so every constituent daily bar is fully closed —
-    the partial current-period candle has no live half-formed data in it.
-    Keeping it lets the trader see this week's/month's move so far.
+    Note on include_partial=True (the default, used by fetch_candles): the
+    input here is cached daily history *plus today's live daily bar*, so the
+    final weekly/monthly candle is the current in-progress period and its
+    close/high/low move until the session closes. That is deliberate — it lets
+    the trader see this week's/month's move so far — but it means the last
+    WEEK/MONTH candle is NOT settled, unlike the DAY candles that feed it.
+    An earlier version of this comment claimed the opposite; it was wrong.
     """
     if df_day.empty:
         return pd.DataFrame()
@@ -504,7 +557,7 @@ def resample_candles(df_day, freq, include_partial=True):
                  .reset_index())
 
     if not include_partial:
-        today = date.today()
+        today = _today_ist()
         if not resampled.empty:
             last_start = pd.Timestamp(resampled["ts"].iloc[-1]).date()
             if freq == "W-MON":
@@ -566,7 +619,7 @@ def _fetch_historical_single(instrument_key, unit, value, from_d_str, to_d_str,
         try:
             r = api_get(url, headers=headers, timeout=15)
             if r.status_code == 200:
-                candles = r.json().get("data", {}).get("candles", [])
+                candles = as_list(as_dict(r.json().get("data")).get("candles"))
                 if candles:
                     return _parse_candle_df(candles)
                 # Upstox returns 200 + empty candles when the date range has no
@@ -735,8 +788,8 @@ def fetch_historical(instrument_key, unit, value, lookback_days, headers, verbos
       into max_span-day chunks (15 for minutes, 90 for hours), fetches each chunk
       separately, and concatenates the results.
     """
-    to_d_obj   = _last_trading_day(date.today() - timedelta(days=1))
-    from_d_obj = _next_trading_day(date.today() - timedelta(days=lookback_days))
+    to_d_obj   = _last_trading_day(_today_ist() - timedelta(days=1))
+    from_d_obj = _next_trading_day(_today_ist() - timedelta(days=lookback_days))
 
     # Clamp: from must not exceed to (e.g. long holiday weekend edge case)
     if from_d_obj > to_d_obj:
@@ -765,7 +818,7 @@ def fetch_intraday_v3(instrument_key, v3_unit, v3_interval, headers, verbose=Tru
         try:
             r = api_get(url, headers=headers, timeout=15)
             if r.status_code == 200:
-                candles = r.json().get("data", {}).get("candles", [])
+                candles = as_list(as_dict(r.json().get("data")).get("candles"))
                 if candles:
                     return _parse_candle_df(candles)
                 if verbose: print("    No intraday candles returned (market closed?).")
@@ -861,6 +914,8 @@ def _cache_save(instrument_key, cache_tf, df):
         # which dominated scan time on a 500-row daily series).
         stamps = pd.to_datetime(df["ts"]).dt.strftime("%Y-%m-%dT%H:%M:%S%z")
         ts_str = [s[:-2] + ":" + s[-2:] for s in stamps]   # +0530 → +05:30
+        # strict=True: a silent length mismatch used to drop or misalign
+        # column values instead of failing loudly.
         rows   = list(zip(
             [instrument_key] * len(df),
             [cache_tf] * len(df),
@@ -872,6 +927,7 @@ def _cache_save(instrument_key, cache_tf, df):
             df["vol"].astype(float).round(2).tolist(),
             (df["oi"] if "oi" in df.columns
              else pd.Series(0.0, index=df.index)).astype(float).round(2).tolist(),
+            strict=True,
         ))
         con.executemany(
             "INSERT OR IGNORE INTO candle_cache "
@@ -973,8 +1029,8 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
     Today's bar is NEVER written to the cache — it is still forming and would
     freeze a partial OHLC row into the store.
     """
-    to_d_obj  = _last_trading_day(date.today() - timedelta(days=1))
-    full_from = _next_trading_day(date.today() - timedelta(days=lookback_days))
+    to_d_obj  = _last_trading_day(_today_ist() - timedelta(days=1))
+    full_from = _next_trading_day(_today_ist() - timedelta(days=lookback_days))
     if full_from > to_d_obj:
         full_from = to_d_obj
 
@@ -1490,7 +1546,7 @@ def calc_volume_profile(df, n_bins=24):
             ((c_lo[zero_mask] - lo) / bin_size).astype(int), 0, n_bins - 1
         )
         overlap[zero_mask] = 0.0
-        for _i, _b in zip(np.where(zero_mask)[0], idx):
+        for _i, _b in zip(np.where(zero_mask)[0], idx, strict=True):
             overlap[_i, _b] = 1.0   # weight = 1.0; multiplied by vol below
         spans[zero_mask] = 1.0       # avoid division by zero
 
@@ -1979,12 +2035,12 @@ def calc_composite_score(entry, tfs=None, target_tf=None):
     else:
         tf_key = None
         for tf in tfs:
-            if tf in entry and entry[tf].get("signal", "NONE") != "NONE":
+            if tf in entry and as_dict(entry[tf]).get("signal", "NONE") != "NONE":
                 tf_key = tf
                 break
         if tf_key is None:
             tf_key = "DAY" if "DAY" in entry else (tfs[0] if tfs else None)
-    e = entry.get(tf_key, {}) if tf_key else {}
+    e = as_dict(entry.get(tf_key)) if tf_key else {}
 
     # Confluence (0-25): normalized to TF count
     # Bug fix: (conf_raw + n) / (2n) maps a fully BEARISH confluence (-n) to
@@ -1999,7 +2055,7 @@ def calc_composite_score(entry, tfs=None, target_tf=None):
     # of how bearish RSI was.  Also removed the contradictory oversold-bounce +10 bonus
     # (detect_signal() deliberately gives 0 rsi_bull_pts at RSI<35, so awarding score
     # points there was inconsistent with the signal engine's own exclusion).
-    rsi = e.get("rsi", 50)
+    rsi = safe_float(e.get("rsi", 50), 50.0)
     sig = e.get("signal", "NONE")
     if sig == "BREAKDOWN":
         if   rsi < 35: score += 15
@@ -2011,19 +2067,19 @@ def calc_composite_score(entry, tfs=None, target_tf=None):
         elif rsi > 45: score += 5
 
     # Volume quality (0-20)
-    vol = e.get("volume", 0)
+    vol = safe_float(e.get("volume", 0))
     score += min(20, vol * 0.2)
 
     # Trend strength (0-20)
     # Bug fix: max(0, (ts+100)/200*20) gave an equally strong bearish reading
     # (-96) just 0.4 of 20 points while +96 got 19.2.  Strength, not sign, is
     # what this term measures — direction is already priced in by confluence.
-    ts = e.get("trend_strength", 0)
-    score += min(20, abs(safe_float(ts)) / 100 * 20)
+    ts = safe_float(e.get("trend_strength", 0))
+    score += min(20, abs(ts) / 100 * 20)
 
     # SuperTrend direction (0-8) — symmetric fix: previously only +8 for bullish ST;
     # bearish ST awarded 0, creating a 14-pt structural gap vs BREAKDOWN setups.
-    st_dir = e.get("st_direction", 0)
+    st_dir = safe_float(e.get("st_direction", 0))
     if   st_dir ==  1 and sig == "BREAKOUT":  score += 8
     elif st_dir == -1 and sig == "BREAKDOWN": score += 8
 
@@ -2875,6 +2931,7 @@ def empty_entry():
         "signal": "NONE", "atr_pct": 0, "volume": 0, "oi": 0,
         "rsi": 0.0, "rel_vol": 0.0, "reason": "", "note": "", "updated": "",
         "price": 0.0, "atr": 0.0, "trend_strength": 0,
+        "day_open": 0.0, "day_high": 0.0, "day_low": 0.0,
         "targets": {}, "support": [], "resistance": [],
         "macd_cross": "", "st_direction": 0,
         "ema_alignment": "",
@@ -2943,7 +3000,7 @@ SIGNAL_BIAS = {"BREAKOUT": 1, "BREAKDOWN": -1, "SIDEWAYS": 0, "NONE": 0}
 
 def confluence_score(sym_data, tfs=None):
     tfs = tfs or TIMEFRAMES_SWING
-    return sum(SIGNAL_BIAS.get(sym_data.get(tf, {}).get("signal", "NONE"), 0) for tf in tfs if tf in sym_data)
+    return sum(SIGNAL_BIAS.get(as_dict(sym_data.get(tf)).get("signal", "NONE"), 0) for tf in tfs if tf in sym_data)
 
 def confluence_label(score):
     # Bug fix: was a dict lookup that silently returned "NEUTRAL [0]" for any |score| > 3.
@@ -2959,7 +3016,9 @@ def confluence_label(score):
 
 def conflict_status(sym_data, tfs=None):
     tfs    = tfs or TIMEFRAMES_SWING
-    active = [sym_data[tf]["signal"] for tf in tfs if tf in sym_data and sym_data[tf]["signal"] != "NONE"]
+    active = [as_dict(sym_data[tf]).get("signal", "NONE") for tf in tfs
+              if tf in sym_data]
+    active = [sig for sig in active if sig != "NONE"]
     if not active:              return C.DIM    + "NO SIGNAL"  + C.RESET
     if len(set(active)) == 1:  return C.GREEN  + "ALIGNED  → " + active[0] + C.RESET
     return                             C.YELLOW + "CONFLICT → mixed signals" + C.RESET
@@ -2980,7 +3039,12 @@ def ema_alignment_label(c):
 def gather_alerts(sym, sym_data, tfs=None):
     tfs    = tfs or TIMEFRAMES_SWING
     alerts = []
-    active = [sym_data[tf]["signal"] for tf in tfs if tf in sym_data and sym_data[tf]["signal"] != "NONE"]
+    # Coerce everything: sym_data[tf] is whatever was in the DB blob, and a
+    # stale or hand-edited row can hold a non-dict. `sym_data[tf]["signal"]`
+    # raised TypeError/KeyError and took the whole alert screen down.
+    active = [as_dict(sym_data[tf]).get("signal", "NONE") for tf in tfs
+              if tf in sym_data]
+    active = [sig for sig in active if sig != "NONE"]
 
     # Conflict
     if len(set(active)) > 1:
@@ -2988,19 +3052,22 @@ def gather_alerts(sym, sym_data, tfs=None):
 
     # Confluence
     score = confluence_score(sym_data, tfs)
-    if score >= 3:  alerts.append((sym, C.GREEN + "STRONG BULL" + C.RESET,  "All 3 TFs BREAKOUT"))
-    if score <= -3: alerts.append((sym, C.RED   + "STRONG BEAR" + C.RESET,  "All 3 TFs BREAKDOWN"))
+    n_all = str(len([tf for tf in tfs if tf in sym_data]))
+    if score >= 3:  alerts.append((sym, C.GREEN + "STRONG BULL" + C.RESET,
+                                   "All " + n_all + " TFs BREAKOUT"))
+    if score <= -3: alerts.append((sym, C.RED   + "STRONG BEAR" + C.RESET,
+                                   "All " + n_all + " TFs BREAKDOWN"))
 
     for tf in tfs:
         if tf not in sym_data:
             continue
-        e = sym_data[tf]
+        e = as_dict(sym_data[tf])
         sig = e.get("signal", "NONE")
-        vol = e.get("volume", 0)
-        oi  = e.get("oi",     0)
-        rsi = e.get("rsi",    50)
+        vol = safe_float(e.get("volume", 0))
+        oi  = safe_float(e.get("oi",     0))
+        rsi = safe_float(e.get("rsi",   50))
         mc  = e.get("macd_cross", "")
-        std = e.get("st_direction", 0)
+        std = safe_float(e.get("st_direction", 0))
 
         if sig == "BREAKOUT"  and vol >= 75:
             alerts.append((sym, "HI-VOL BO  [" + tf + "]", "Vol=" + str(vol) + "%"))
@@ -3195,7 +3262,7 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
             rr   = round(rew / risk, 1) if risk > 0 else 0.0
 
         # Signal change detection
-        prev_sig    = data[sym][tf].get("signal", "NONE")
+        prev_sig    = as_dict(data[sym][tf]).get("signal", "NONE")
         sig_changed = (prev_sig != signal and prev_sig != "NONE")
 
         entry = {
@@ -3207,6 +3274,13 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
             "rel_vol":           rv_val,
             "reason":            reason,
             "note":              note,
+            # OHLC of the last candle. Needed by calc_next_day_gap_score to
+            # measure where the close sits inside the period's range; the
+            # stored entry previously carried "price" only, so that factor
+            # silently fell back to trend_strength and double-counted it.
+            "day_open":          round(safe_float(last.get("open",  0)), 2),
+            "day_high":          round(safe_float(last.get("high",  0)), 2),
+            "day_low":           round(safe_float(last.get("low",   0)), 2),
             "updated":           datetime.now(IST).strftime("%Y-%m-%d %H:%M"),
             "candle_date":       candle_date,   # actual date of last candle's data
             "price":             price,
@@ -3304,7 +3378,7 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
     for tf in use_tfs:
         if tf not in data[sym]:
             continue
-        e = data[sym][tf]
+        e = as_dict(data[sym][tf])
         # NONE signals are intentionally skipped here:
         # - Composite score is meaningless with no directional signal (conf=0, RSI pts=0)
         # - History table is kept signal-only so the history view stays actionable
@@ -3464,7 +3538,7 @@ def _score_tf_key(entry, tfs):
     """
     preferred = ["DAY", "WEEK", "MONTH", "1HR", "15MIN", "5MIN"]
     for tf in preferred:
-        if tf in entry and entry[tf].get("price", 0):
+        if tf in entry and safe_float(as_dict(entry[tf]).get("price", 0)):
             return tf
     # Fallback: first tf in tfs that exists in entry (even if price=0)
     for tf in tfs:
@@ -3484,7 +3558,7 @@ def dashboard(data, tfs=None):
     bo = bd = sw = no = 0
     for e in data.values():
         for tf in tfs:
-            s = e.get(tf, {}).get("signal", "NONE")
+            s = as_dict(e.get(tf)).get("signal", "NONE")
             if s == "BREAKOUT":  bo += 1
             if s == "BREAKDOWN": bd += 1
             if s == "SIDEWAYS":  sw += 1
@@ -3537,19 +3611,19 @@ def dashboard(data, tfs=None):
     for sym, entry in ranked:
         signals = []
         for tf in tf_show:
-            s  = entry.get(tf, {}).get("signal", "NONE")
-            sc = entry.get(tf, {}).get("signal_changed", False)
+            s  = as_dict(entry.get(tf)).get("signal", "NONE")
+            sc = as_dict(entry.get(tf)).get("signal_changed", False)
             tag = sig_str(s) + (C.YELLOW + "⚡" + C.RESET if sc else "")
             signals.append(tag)
 
         _stf   = _score_tf_key(entry, tfs)
         # Coerce: a stale/corrupt row can hold a non-numeric value, and a bare
         # `cscore >= 65` comparison then raises TypeError mid-render.
-        vol    = int(safe_float(entry.get(_stf, {}).get("volume",          0)))
-        atr_p  = safe_float(entry.get(_stf, {}).get("atr_pct",         0))
-        price  = safe_float(entry.get(_stf, {}).get("price",           0))
-        str_v  = safe_float(entry.get(_stf, {}).get("trend_strength",  0))
-        cscore = safe_float(entry.get(_stf, {}).get("composite_score", 0))
+        vol    = int(safe_float(as_dict(entry.get(_stf)).get("volume",          0)))
+        atr_p  = safe_float(as_dict(entry.get(_stf)).get("atr_pct",         0))
+        price  = safe_float(as_dict(entry.get(_stf)).get("price",           0))
+        str_v  = safe_float(as_dict(entry.get(_stf)).get("trend_strength",  0))
+        cscore = safe_float(as_dict(entry.get(_stf)).get("composite_score", 0))
         score  = confluence_score(entry, tfs)
         conf   = confluence_label(score)
         sector = SECTOR_MAP.get(sym, "")[:7]
@@ -3597,6 +3671,11 @@ def view_detail(sym, data):
     """
     wl       = load_watchlist()
     sym_data = data[sym]
+    # Coerce every TF entry to a dict. Rows come from a JSON blob in SQLite,
+    # and a stale or hand-edited one can hold a scalar — sym_data[tf].get(...)
+    # then raised AttributeError and killed the whole detail screen.
+    sym_data = {k: (as_dict(v) if k in TF_CONFIG else v)
+                for k, v in sym_data.items()}
     sector   = SECTOR_MAP.get(sym, "")
     star_str = (C.YELLOW + " ★ WATCHLIST" + C.RESET) if sym in wl else ""
     # Bug fix: was hardcoded TIMEFRAMES_SWING — intraday BREAKDOWN signals
@@ -3609,7 +3688,7 @@ def view_detail(sym, data):
     conf_tfs = scanned_tfs if scanned_tfs else TIMEFRAMES_SWING
     conf     = confluence_score(sym_data, conf_tfs)
     conf_lbl = confluence_label(conf)
-    day_e    = sym_data.get("DAY", {})
+    day_e    = as_dict(sym_data.get("DAY"))
     price    = day_e.get("price", 0)
 
     header("◉ " + sym + "  [" + sector + "]" + star_str)
@@ -3620,7 +3699,7 @@ def view_detail(sym, data):
     div("─")
     tf_order = [tf for tf in list(TF_CONFIG.keys()) if tf in sym_data]
     for tf in tf_order:
-        e   = sym_data[tf]
+        e   = as_dict(sym_data[tf])
         sig = e.get("signal", "NONE")
         col = signal_color(sig)
         chg = C.YELLOW + " ⚡CHANGED" + C.RESET if e.get("signal_changed") else ""
@@ -3688,7 +3767,7 @@ def view_detail(sym, data):
     cprint("  TIMEFRAME ANALYSIS", C.WHITE, bold=True)
     print()
     for tf in tf_order:
-        e   = sym_data[tf]
+        e   = as_dict(sym_data[tf])
         sig = e.get("signal", "NONE")
         col = signal_color(sig)
 
@@ -3846,7 +3925,7 @@ def view_detail(sym, data):
     # Find best TF setup (highest scoring breakout or breakdown)
     best_tf = None; best_score = -1
     for tf in tf_order:
-        e   = sym_data[tf]
+        e   = as_dict(sym_data[tf])
         sig = e.get("signal","NONE")
         cs  = e.get("composite_score",0)
         if sig in ("BREAKOUT","BREAKDOWN") and cs > best_score:
@@ -3996,9 +4075,9 @@ def generate_stock_summary(sym, sym_data, tfs=None):
 
     # ── MULTI-TF CONFLUENCE ───────────────────────────────────
     bo_tfs = [tf for tf in tfs
-              if sym_data.get(tf, {}).get("signal") == "BREAKOUT"]
+              if as_dict(sym_data.get(tf)).get("signal") == "BREAKOUT"]
     bd_tfs = [tf for tf in tfs
-              if sym_data.get(tf, {}).get("signal") == "BREAKDOWN"]
+              if as_dict(sym_data.get(tf)).get("signal") == "BREAKDOWN"]
 
     if len(bo_tfs) >= 2:
         buy_reasons.append(
@@ -4437,22 +4516,22 @@ def sector_view(data):
 
     for sec, items in sorted(sectors.items()):
         cprint("\n  ┌─ " + sec + " " + "─" * (W - 5 - len(sec)), C.CYAN, bold=True)
-        bo = sum(1 for _, e in items if e.get("DAY", {}).get("signal") == "BREAKOUT")
-        bd = sum(1 for _, e in items if e.get("DAY", {}).get("signal") == "BREAKDOWN")
-        sw = sum(1 for _, e in items if e.get("DAY", {}).get("signal") == "SIDEWAYS")
+        bo = sum(1 for _, e in items if as_dict(e.get("DAY")).get("signal") == "BREAKOUT")
+        bd = sum(1 for _, e in items if as_dict(e.get("DAY")).get("signal") == "BREAKDOWN")
+        sw = sum(1 for _, e in items if as_dict(e.get("DAY")).get("signal") == "SIDEWAYS")
         print("  │  " + C.GREEN + "BO:" + str(bo) + C.RESET + "  " +
               C.RED + "BD:" + str(bd) + C.RESET + "  " +
               C.YELLOW + "SW:" + str(sw) + C.RESET)
         for sym, entry in items:
             score = confluence_score(entry, TIMEFRAMES_SWING)
-            d = sig_str(entry.get("DAY",   {}).get("signal", "NONE"))
-            w = sig_str(entry.get("WEEK",  {}).get("signal", "NONE"))
-            m = sig_str(entry.get("MONTH", {}).get("signal", "NONE"))
+            d = sig_str(as_dict(entry.get("DAY")).get("signal", "NONE"))
+            w = sig_str(as_dict(entry.get("WEEK")).get("signal", "NONE"))
+            m = sig_str(as_dict(entry.get("MONTH")).get("signal", "NONE"))
             # Bug fix: fallback was list(entry.keys())[0] which is "symbol" (a string),
             # causing AttributeError when .get("price",0) is called on it.
             _tf_key = "DAY" if "DAY" in entry else next(
                 (tf for tf in TF_CONFIG if tf in entry), None)
-            price = safe_float(entry.get(_tf_key, {}).get("price", 0)) if _tf_key else 0
+            price = safe_float(as_dict(entry.get(_tf_key)).get("price", 0)) if _tf_key else 0
             price_str = "₹" + str(price) if price else "—"
             print("  │    " +
                   _ljust(sym,  14) + "  " +
@@ -4470,13 +4549,13 @@ def filter_view(data, signal, tfs=None):
     found = False
     rows  = []
     for sym, entry in data.items():
-        matching = [tf for tf in tfs if entry.get(tf, {}).get("signal") == signal]
+        matching = [tf for tf in tfs if as_dict(entry.get(tf)).get("signal") == signal]
         if matching:
             found  = True
             tfs_str= " + ".join(matching)
-            liq    = max(safe_float(entry[tf].get("atr_pct", 0)) for tf in matching if tf in entry)
-            vol    = max(safe_float(entry[tf].get("volume",    0)) for tf in matching if tf in entry)
-            oi     = max(safe_float(entry[tf].get("oi",        0)) for tf in matching if tf in entry)
+            liq    = max(safe_float(as_dict(entry[tf]).get("atr_pct", 0)) for tf in matching if tf in entry)
+            vol    = max(safe_float(as_dict(entry[tf]).get("volume",    0)) for tf in matching if tf in entry)
+            oi     = max(safe_float(as_dict(entry[tf]).get("oi",        0)) for tf in matching if tf in entry)
             rsi    = safe_float(entry[matching[0]].get("rsi", 0))
             str_v  = safe_float(entry[matching[0]].get("trend_strength", 0))
             rows.append((sym, tfs_str, liq, vol, oi, rsi, str_v))
@@ -4522,7 +4601,7 @@ def statistics_view(data):
         for entry in data.values():
             if tf not in entry:
                 continue
-            e = entry[tf]
+            e = as_dict(entry[tf])
             s = e.get("signal", "NONE")
             counts[s] = counts.get(s, 0) + 1
             if s != "NONE":
@@ -4778,7 +4857,7 @@ def watchlist_view(data, tfs=None):
         rr     = safe_float(e.get("risk_reward", 0))
         conf   = confluence_score(entry, tfs)
         signals_str = "  ".join(
-            sig_str(entry.get(tf, {}).get("signal", "NONE")) for tf in tfs)
+            sig_str(as_dict(entry.get(tf)).get("signal", "NONE")) for tf in tfs)
         price_str = fmt_price(price)
 
         print("  " + C.YELLOW + "★ " + C.RESET +
@@ -4859,7 +4938,7 @@ def export_csv(data, tfs=None):
             for tf in tfs:
                 if tf not in entry:
                     continue
-                e    = entry[tf]
+                e    = as_dict(entry[tf])
                 fib  = as_dict(e.get("fibonacci"))
                 w52  = as_dict(e.get("52w"))
                 div_ = as_dict(e.get("rsi_divergence"))
@@ -4926,7 +5005,7 @@ def export_report(data, tfs=None):
         for tf in list(TF_CONFIG.keys()):
             if tf not in entry:
                 continue
-            e   = entry[tf]
+            e   = as_dict(entry[tf])
             fib = as_dict(e.get("fibonacci"))
             w52 = as_dict(e.get("52w"))
             div_= as_dict(e.get("rsi_divergence"))
@@ -5046,23 +5125,23 @@ def export_html(data, tfs=None):
     # ── Pre-compute summary stats ─────────────────────────────
     bo_d = bd_d = sw_d = no_d = 0
     for e in data.values():
-        s = e.get("DAY", {}).get("signal","NONE")
+        s = as_dict(e.get("DAY")).get("signal","NONE")
         if s == "BREAKOUT":  bo_d += 1
         elif s == "BREAKDOWN": bd_d += 1
         elif s == "SIDEWAYS":  sw_d += 1
         else: no_d += 1
 
     all_bo_syms = [sym for sym,e in data.items()
-                   if all(e.get(tf,{}).get("signal","NONE")=="BREAKOUT" for tf in tfs)]
+                   if all(as_dict(e.get(tf)).get("signal","NONE")=="BREAKOUT" for tf in tfs)]
     all_bd_syms = [sym for sym,e in data.items()
-                   if all(e.get(tf,{}).get("signal","NONE")=="BREAKDOWN" for tf in tfs)]
+                   if all(as_dict(e.get(tf)).get("signal","NONE")=="BREAKDOWN" for tf in tfs)]
 
     # Sector breakdown (DAY)
     sectors = {}
     for sym,e in data.items():
         sec = SECTOR_MAP.get(sym,"OTHER")
         if sec not in sectors: sectors[sec] = {"BO":0,"BD":0,"SW":0,"N":0}
-        s = e.get("DAY",{}).get("signal","NONE")
+        s = as_dict(e.get("DAY")).get("signal","NONE")
         if s == "BREAKOUT":   sectors[sec]["BO"] += 1
         elif s == "BREAKDOWN":sectors[sec]["BD"] += 1
         elif s == "SIDEWAYS": sectors[sec]["SW"] += 1
@@ -5070,8 +5149,8 @@ def export_html(data, tfs=None):
 
     # Sort all symbols by DAY composite score desc
     ranked = sorted(
-        [(sym,e) for sym,e in data.items() if e.get("DAY",{}).get("price",0)],
-        key=lambda x: safe(x[1].get("DAY",{}).get("composite_score",0)), reverse=True)
+        [(sym,e) for sym,e in data.items() if as_dict(e.get("DAY")).get("price",0)],
+        key=lambda x: safe(as_dict(x[1].get("DAY")).get("composite_score", 0)), reverse=True)
 
     # ── Build HTML ────────────────────────────────────────────
     H = []
@@ -5234,7 +5313,7 @@ tr:last-child td{border-bottom:none}
     # ── SIDE NAV ─────────────────────────────────────────────
     w('<div class="nav"><div class="nav-title">Symbols</div>')
     for sym, e in ranked:
-        sig = e.get("DAY", {}).get("signal", "NONE")
+        sig = as_dict(e.get("DAY")).get("signal", "NONE")
         w('<a href="#sym-' + sym + '" class="' + sc(sig) + '">' + sym + '</a>')
     w('</div>')
 
@@ -5279,9 +5358,9 @@ tr:last-child td{border-bottom:none}
         w('<th>' + h + '</th>')
     w('</tr></thead><tbody>')
     allbo_data = [(sym, data[sym]) for sym in all_bo_syms if sym in data]
-    allbo_data.sort(key=lambda x: safe(x[1].get("DAY",{}).get("composite_score",0)), reverse=True)
+    allbo_data.sort(key=lambda x: safe(as_dict(x[1].get("DAY")).get("composite_score", 0)), reverse=True)
     for sym, e in allbo_data:
-        de = e.get("DAY", {})
+        de = as_dict(e.get("DAY"))
         cs = int(safe(de.get("composite_score",0)))
         sc_col = "var(--gr)" if cs >= 65 else ("var(--ye)" if cs >= 40 else "var(--re)")
         rsi = safe(de.get("rsi",0))
@@ -5309,7 +5388,7 @@ tr:last-child td{border-bottom:none}
         w('<th>' + h + '</th>')
     w('</tr></thead><tbody>')
     for sym, e in ranked:
-        de  = e.get("DAY",{})
+        de  = as_dict(e.get("DAY"))
         sig = de.get("signal","NONE")
         cs  = int(safe(de.get("composite_score",0)))
         sc_col = "var(--gr)" if cs>=65 else ("var(--ye)" if cs>=40 else "var(--re)")
@@ -5326,7 +5405,7 @@ tr:last-child td{border-bottom:none}
         w('<tr><td><a href="#sym-' + esc(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
         w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(sig,"--") + '</span></td>')
         for tf in tfs:
-            s2 = e.get(tf,{}).get("signal","NONE")
+            s2 = as_dict(e.get(tf)).get("signal","NONE")
             w('<td><span class="badge ' + sc(s2) + '">' + SIGNAL_SHORT.get(s2,"--") + '</span></td>')
         w('<td><div class="sbar-num" style="color:' + sc_col + '">' + str(cs) + '</div><div class="sbar-wrap"><div class="sbar-bg"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></div></td>')
         w('<td class="mono">' + fmt_p(de.get("price",0)) + '</td>')
@@ -5346,7 +5425,7 @@ tr:last-child td{border-bottom:none}
         conf_lbl_map = {3:"STRONG BULL",2:"BULL",1:"WEAK BULL",0:"NEUTRAL",-1:"WEAK BEAR",-2:"BEAR"}
         conf_str = conf_lbl_map.get(conf, ("STRONG BULL" if conf>3 else "STRONG BEAR"))
         conf_col = "var(--gr)" if conf>=2 else ("var(--re)" if conf<=-2 else "var(--ye)")
-        day_e   = e.get("DAY",{})
+        day_e   = as_dict(e.get("DAY"))
         price   = safe(day_e.get("price",0))
 
         w('<div class="det-card" id="sym-' + sym + '">')
@@ -5358,7 +5437,7 @@ tr:last-child td{border-bottom:none}
         w('  <div class="tfdots">')
         for tf in list(TF_CONFIG.keys()):
             if tf in e:
-                s2 = e[tf].get("signal","NONE")
+                s2 = as_dict(e[tf]).get("signal", "NONE")
                 w('    <div class="tfd ' + sc(s2) + '" title="' + esc(tf + ': ' + s2) + '">' + tf[:1] + ('M' if tf=="15MIN" else tf[1:2] if tf not in ["5MIN","1HR","DAY"] else '') + '</div>')
         w('  </div>')
         w('</div>')
@@ -5372,7 +5451,7 @@ tr:last-child td{border-bottom:none}
             w('<th>' + h + '</th>')
         w('</tr></thead><tbody>')
         for tf in tf_order:
-            te  = e[tf]
+            te  = as_dict(e[tf])
             sig = te.get("signal","NONE")
             cs  = int(safe(te.get("composite_score",0)))
             sc_col = "var(--gr)" if cs>=65 else ("var(--ye)" if cs>=40 else ("var(--re)" if cs>0 else "var(--mu)"))
@@ -5395,7 +5474,7 @@ tr:last-child td{border-bottom:none}
 
         # Per-TF detail blocks
         for tf in tf_order:
-            te  = e[tf]
+            te  = as_dict(e[tf])
             sig = te.get("signal","NONE")
             if sig == "NONE": continue
             atr   = safe(te.get("atr",0))
@@ -5620,7 +5699,7 @@ def edit_note(sym, data):
         save_note(sym, n)
         # Also update in-memory scan_data so display reflects the change immediately
         for tf in list(TF_CONFIG.keys()):
-            if tf in data.get(sym, {}):
+            if isinstance(as_dict(data.get(sym)).get(tf), dict):
                 data[sym][tf]["note"] = n
         save_data(data)
         cprint("  ✓ Note saved.", C.GREEN)
@@ -5656,7 +5735,7 @@ def calc_next_day_gap_score(sym_data):
       bias       "GAP_UP" / "NEUTRAL" / "GAP_DOWN"
       factors    list of (label, pts) for display
     """
-    e      = sym_data.get("DAY", {})
+    e      = as_dict(sym_data.get("DAY"))
     price  = safe_float(e.get("price",  0))
     if not price:
         return 50, "NEUTRAL", []
@@ -5664,22 +5743,37 @@ def calc_next_day_gap_score(sym_data):
     raw   = 0.0
     facts = []
 
-    # ── 1. Close position in day range ───────────────────────
-    # Trend strength > 50 implies strong close (close near high);
-    # < -50 implies weak close (close near low).
+    # ── 1. Close position in the period's range ──────────────
+    # Bug fix: this factor claimed to measure where the close sat inside the
+    # day's high-low range, but it actually read trend_strength — a different
+    # quantity that factor 8 already scores. So the label lied and trend
+    # strength was double-counted, contributing up to ±27 of the ±80 raw
+    # range (a third of the whole score) instead of the documented ±7.
+    # Now uses the real OHLC, with the old proxy only as a fallback for rows
+    # written by a scanner that predates the day_high/day_low keys.
     ts = safe_float(e.get("trend_strength", 0))
-    if   ts >= 70:  pts = 20;  label = "Close near High (strong)"
-    elif ts >= 40:  pts = 10;  label = "Close in upper range"
-    elif ts >= 0:   pts =  3;  label = "Close mid-range"
-    elif ts >= -40: pts = -8;  label = "Close in lower range"
-    else:           pts = -20; label = "Close near Low (weak)"
+    hi = safe_float(e.get("day_high", 0))
+    lo = safe_float(e.get("day_low",  0))
+    if hi > lo > 0:
+        pos = (price - lo) / (hi - lo)          # 0 = at the low, 1 = at the high
+        if   pos >= 0.8: pts =  20; label = "Close near High (top 20% of range)"
+        elif pos >= 0.6: pts =  10; label = "Close in upper range"
+        elif pos >= 0.4: pts =   3; label = "Close mid-range"
+        elif pos >= 0.2: pts =  -8; label = "Close in lower range"
+        else:            pts = -20; label = "Close near Low (bottom 20%)"
+    else:
+        if   ts >= 70:  pts = 20;  label = "Close near High (strong)"
+        elif ts >= 40:  pts = 10;  label = "Close in upper range"
+        elif ts >= 0:   pts =  3;  label = "Close mid-range"
+        elif ts >= -40: pts = -8;  label = "Close in lower range"
+        else:           pts = -20; label = "Close near Low (weak)"
     raw += pts; facts.append((label, pts))
 
     # ── 2. Multi-TF signal confluence ────────────────────────
     # Swing TF confluence (DAY/WEEK/MONTH) carries the most weight for next-day gaps.
     tfs_all   = ["DAY", "WEEK", "MONTH"]
     conf_raw  = sum({"BREAKOUT":1,"BREAKDOWN":-1}.get(
-                    sym_data.get(tf, {}).get("signal","NONE"), 0)
+                    as_dict(sym_data.get(tf)).get("signal","NONE"), 0)
                     for tf in tfs_all)
     pts = conf_raw * 6   # -18..+18
     label = {3:"All TFs BREAKOUT", 2:"2 TFs BREAKOUT", 1:"1 TF BREAKOUT",
@@ -5693,12 +5787,12 @@ def calc_next_day_gap_score(sym_data):
     # the gap score was 87% GAP UP — ignoring a clear near-term bearish signal.
     # Now add a mild ±8 correction based on intraday consensus.
     tfs_intra  = ["5MIN", "15MIN", "1HR"]
-    intra_sigs = [sym_data.get(tf, {}).get("signal", "NONE") for tf in tfs_intra
-                  if sym_data.get(tf, {}).get("signal", "NONE") != "NONE"]
+    intra_sigs = [as_dict(sym_data.get(tf)).get("signal", "NONE") for tf in tfs_intra
+                  if as_dict(sym_data.get(tf)).get("signal", "NONE") != "NONE"]
     if intra_sigs:
         intra_raw = sum({"BREAKOUT":1,"BREAKDOWN":-1}.get(s, 0) for s in intra_sigs)
         # Scale: ±3 intraday TFs → ±8 pts (less influential than swing ±18)
-        intra_pts = int(round(intra_raw / max(len(intra_sigs), 1) * 8))
+        intra_pts = round(intra_raw / max(len(intra_sigs), 1) * 8)
         if intra_pts != 0:
             i_dir = "bullish" if intra_pts > 0 else "bearish"
             raw += intra_pts
@@ -5803,7 +5897,7 @@ def next_day_gap_view(data):
     rows = []
     for sym, sym_data in data.items():
         score, bias, facts = calc_next_day_gap_score(sym_data)
-        e      = sym_data.get("DAY", {})
+        e      = as_dict(sym_data.get("DAY"))
         price  = e.get("price", 0)
         rsi    = safe_float(e.get("rsi",   0))
         rv     = safe_float(e.get("rel_vol", 0))
@@ -5901,7 +5995,7 @@ def next_day_gap_view(data):
         if bias == "GAP_UP":
             cprint("    • At open: if gap-up confirmed → buy on first 5MIN pullback to VWAP", C.DIM)
             cprint("    • Stop: below prev day low or gap fill level", C.DIM)
-            cprint("    • Target 1: " + str(data[pick].get("DAY",{}).get("targets",{}).get("target1","—")), C.DIM)
+            cprint("    • Target 1: " + str(as_dict(as_dict(data[pick].get("DAY")).get("targets")).get("target1", "—")), C.DIM)
         elif bias == "GAP_DOWN":
             cprint("    • At open: if gap-down confirmed → wait for bounce to prev_close, short", C.DIM)
             cprint("    • Stop: above prev day high", C.DIM)
@@ -5994,12 +6088,12 @@ def heatmap_view(data, tfs=None):
         for sym in syms:
             entry  = data[sym]
             _stf   = _score_tf_key(entry, tfs)
-            cscore = safe_float(entry.get(_stf, {}).get("composite_score", 0))
-            ts     = safe_float(entry.get(_stf, {}).get("trend_strength",  0))
+            cscore = safe_float(as_dict(entry.get(_stf)).get("composite_score", 0))
+            ts     = safe_float(as_dict(entry.get(_stf)).get("trend_strength",  0))
             star   = C.YELLOW + "★" + C.RESET if sym in wl else " "
 
             tf_cells = "  ".join(
-                _rjust(SIG_CELL.get(entry.get(tf, {}).get("signal", "NONE"),
+                _rjust(SIG_CELL.get(as_dict(entry.get(tf)).get("signal", "NONE"),
                                     C.DIM + "--" + C.RESET), col_tf)
                 for tf in tf_show)
 
@@ -6061,7 +6155,7 @@ def gap_scanner_view(data):
     gaps = []
     missing = []
     for sym, entry in data.items():
-        e   = entry.get("DAY", {})
+        e   = as_dict(entry.get("DAY"))
         gap = as_dict(e.get("gap"))
         if not gap:
             missing.append(sym)
@@ -6426,7 +6520,7 @@ def auto_schedule_scan(data, active_tfs):
                 scan_tfs = use_tfs
 
             # ── Scan ─────────────────────────────────────────
-            prev_sigs = {sym: {tf: data.get(sym, {}).get(tf, {}).get("signal", "NONE")
+            prev_sigs = {sym: {tf: as_dict(as_dict(data.get(sym)).get(tf)).get("signal", "NONE")
                                 for tf in scan_tfs}
                          for sym in target.values()}
 
@@ -6455,8 +6549,8 @@ def auto_schedule_scan(data, active_tfs):
             new_bd_syms = []
             for sym in target.values():
                 for tf in scan_tfs:
-                    sig = data.get(sym, {}).get(tf, {}).get("signal", "NONE")
-                    old = prev_sigs.get(sym, {}).get(tf, "NONE")
+                    sig = as_dict(as_dict(data.get(sym)).get(tf)).get("signal", "NONE")
+                    old = as_dict(prev_sigs.get(sym)).get(tf, "NONE")
                     if sig == "BREAKOUT":  bo += 1
                     if sig == "BREAKDOWN": bd += 1
                     if sig == "SIDEWAYS":  sw += 1
@@ -6874,6 +6968,22 @@ def select_db_file(silent=False):
 
 ACTIVE_TFS = list(TIMEFRAMES_SWING)  # runtime TF selection
 
+def _warn_stale_holiday_calendar():
+    """Nag once if NSE_HOLIDAYS has no entry for the current year.
+
+    Bug fix: the holiday list has to be refreshed by hand each December.
+    Silently running a year past its end made every holiday look like a
+    trading day again — the exact failure the list exists to prevent.
+    """
+    this_year = _today_ist().year
+    if this_year in _NSE_HOLIDAY_YEARS:
+        return
+    cprint("  ⚠  NSE_HOLIDAYS has no entries for " + str(this_year) + ".", C.YELLOW)
+    cprint("     Weekends are still handled, but market holidays this year will be")
+    cprint("     treated as trading days. Add the list to NSE_HOLIDAYS.", C.YELLOW)
+    print()
+
+
 def main_menu_loop(data, tfs):
     """
     Drive the interactive main menu until the user chooses 0 (Quit).
@@ -7195,6 +7305,7 @@ def main_menu_loop(data, tfs):
 def main():
     select_db_file(silent=True)   # silent at startup; menu option ~ is not
     _db_connect()                 # initialise DB + tables on first run
+    _warn_stale_holiday_calendar()
     data = load_data()
     for sym in SYMBOL_MAP.values():
         ensure_symbol(data, sym)

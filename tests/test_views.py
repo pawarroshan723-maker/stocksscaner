@@ -7,12 +7,12 @@ against empty data) and fail on any unhandled exception.
 """
 import io
 from contextlib import redirect_stdout
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pandas as pd
 import pytest
 
-from tests.fake_upstox import FakeUpstox, make_daily_series
+from tests.fake_upstox import FakeUpstox, make_daily_series, today_ist
 
 ALL_TFS = ["5MIN", "15MIN", "1HR", "DAY", "WEEK", "MONTH"]
 SWING = ["DAY", "WEEK", "MONTH"]
@@ -37,7 +37,7 @@ def scanned(mod, api, monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda *a: "")
     monkeypatch.chdir(tmp_path)
 
-    today = date.today()
+    today = today_ist()
     api.daily = make_daily_series(n=500, end=today - timedelta(days=1), seed=42)
     live = pd.DataFrame({
         "ts": [pd.Timestamp(today).tz_localize("Asia/Kolkata")],
