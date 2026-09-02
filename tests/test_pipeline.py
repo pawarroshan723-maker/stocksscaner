@@ -349,3 +349,98 @@ def test_gap_score_never_claims_certainty(mod):
                            rsi=90.0, rel_vol=5.0))
             assert 5 <= score <= 95, (price, ts, score)
             assert bias in ("GAP_UP", "NEUTRAL", "GAP_DOWN")
+
+
+# ── entry / stop / target geometry ──────────────────────────
+CLOSE = 1000.0
+ATR = 20.0
+
+
+def _flat_df(n=60, close=CLOSE, atr=ATR, seed=0):
+    """Flat OHLCV with a constant ATR column, ready for get_price_targets."""
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2026-01-01", periods=n, freq="D", tz="Asia/Kolkata")
+    c = np.full(n, close)
+    return pd.DataFrame({
+        "ts": ts, "open": c,
+        "high": c + rng.uniform(1.0, 5.0, n),
+        "low": c - rng.uniform(1.0, 5.0, n),
+        "close": c, "vol": np.full(n, 1e5), "oi": np.zeros(n),
+        "atr": atr,
+    })
+
+
+def _with_level(df, kind, mult):
+    """Plant a single swing high/low `mult` × ATR away from the close."""
+    df = df.copy()
+    i = df.index[-3]
+    if kind == "res":
+        df.loc[i, "high"] = CLOSE + mult * ATR
+    else:
+        df.loc[i, "low"] = CLOSE - mult * ATR
+    return df
+
+
+@pytest.mark.parametrize("tf", ["5MIN", "15MIN", "1HR", "DAY", "WEEK", "MONTH"])
+@pytest.mark.parametrize("mult", [0.5, 1.0, 2.0, 3.0, 3.5, 5.0, 7.0, 9.0, 12.0])
+def test_breakout_levels_are_ordered_stop_lt_entry_lt_t1_lt_t2(mod, tf, mult):
+    """Regression: T2 was a fixed close+3×ATR while T1 was the nearest swing,
+    so a single qualifying level further than 3×ATR inverted the ladder and
+    the trade plan printed "T1 ₹1100 / T2 ₹1060" — book the second half at a
+    worse price than the first.
+    """
+    t = mod.get_price_targets(_with_level(_flat_df(), "res", mult),
+                              "BREAKOUT", tf)
+    if not t:
+        pytest.skip("no levels qualified for this TF/mult combination")
+    sl, t1, t2 = t["stop"], t["target1"], t["target2"]
+    assert sl < CLOSE < t1 < t2, (tf, mult, sl, t1, t2)
+    # T2 must be a real step up, not a duplicate of T1: two swing levels
+    # closer than half an ATR are one level for trading purposes.
+    assert t2 - t1 >= 0.5 * ATR, (tf, mult, t1, t2)
+
+
+@pytest.mark.parametrize("tf", ["5MIN", "15MIN", "1HR", "DAY", "WEEK", "MONTH"])
+@pytest.mark.parametrize("mult", [0.5, 1.0, 2.0, 3.0, 3.5, 5.0, 7.0, 9.0, 12.0])
+def test_breakdown_levels_are_ordered_t2_lt_t1_lt_entry_lt_stop(mod, tf, mult):
+    """Mirror of the above: on a short, T2 must sit BELOW T1."""
+    t = mod.get_price_targets(_with_level(_flat_df(), "sup", mult),
+                              "BREAKDOWN", tf)
+    if not t:
+        pytest.skip("no levels qualified for this TF/mult combination")
+    sl, t1, t2 = t["stop"], t["target1"], t["target2"]
+    assert t2 < t1 < CLOSE < sl, (tf, mult, t2, t1, sl)
+    assert t1 - t2 >= 0.5 * ATR, (tf, mult, t1, t2)
+
+
+@pytest.mark.parametrize("signal", ["BREAKOUT", "BREAKDOWN"])
+def test_levels_are_never_negative_or_absurd(mod, signal):
+    """_floor_price must keep every level positive even with a crazy ATR."""
+    for atr in (1.0, 20.0, 200.0, 900.0, 5000.0):
+        t = mod.get_price_targets(_flat_df(atr=atr), signal, "DAY")
+        if not t:
+            continue
+        for key in ("target1", "target2", "stop"):
+            assert t[key] > 0, (atr, key, t[key])
+            assert np.isfinite(t[key])
+
+
+def test_risk_reward_matches_the_stop_and_target1(mod):
+    """The displayed R:R must be |T1-entry| / |entry-stop|, not stale."""
+    df = _with_level(_flat_df(), "res", 2.0)
+    t = mod.get_price_targets(df, "BREAKOUT", "DAY")
+    assert t
+    risk = abs(CLOSE - t["stop"])
+    reward = abs(t["target1"] - CLOSE)
+    assert risk > 0
+    assert round(reward / risk, 1) > 0
+    # stop must be a meaningful distance out, not a micro-level
+    assert risk >= 0.4 * ATR, "stop closer than the documented minimum"
+
+
+def test_no_levels_returns_empty_not_a_flat_dict(mod):
+    assert mod.get_price_targets(_flat_df(), "SIDEWAYS", "DAY") == {}
+    assert mod.get_price_targets(_flat_df(), "NONE", "DAY") == {}
+    empty = _flat_df().iloc[0:0]
+    assert mod.get_price_targets(empty, "BREAKOUT", "DAY") == {}

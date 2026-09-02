@@ -2553,6 +2553,10 @@ def get_price_targets(df, signal, tf="DAY"):
     lookback_n, max_sl_atr, max_t_atr, min_sl_atr = _TF_PARAMS.get(
         tf, _TF_PARAMS["DAY"])  # safe default
 
+    # Minimum separation between T1 and T2, as a fraction of ATR. Two swing
+    # levels closer than this are one level for trading purposes.
+    _MIN_T2_GAP_ATR = 0.5
+
     lookback = min(lookback_n, len(df))
     recent   = df.tail(lookback)
     highs    = recent["high"]
@@ -2589,6 +2593,20 @@ def get_price_targets(df, signal, tf="DAY"):
         t1 = res_levels[0] if res_levels          else round(close + 1.5 * atr, 2)
         t2 = res_levels[1] if len(res_levels) > 1 else round(close + 3.0 * atr, 2)
         sl = sup_levels[0] if sup_levels           else round(close - 1.0 * atr, 2)
+        # Bug fix: the T2 fallback is a fixed 3×ATR measured from `close`,
+        # but T1 is the nearest qualifying swing level — which the caps allow
+        # to sit anywhere up to max_t_atr (8×ATR on DAY) away. When exactly
+        # one level qualified and it was further out than 3×ATR, T2 landed
+        # BELOW T1, so the trade plan read "T1 ₹1100 / T2 ₹1060" and told the
+        # user to book the second half at a worse price than the first.
+        #
+        # Second half of the same bug: two swing highs 0.5×ATR or less apart
+        # are the *same* level as far as a trader is concerned — well inside
+        # one session's noise. That printed "T1 ₹969.23 / T2 ₹970.02", i.e.
+        # "book half at 969 and the rest at 970", which is not a ladder.
+        # In both cases rebuild T2 as an ATR-scaled extension of T1.
+        if t2 - t1 < _MIN_T2_GAP_ATR * atr:
+            t2 = round(t1 + 1.5 * atr, 2)
         return {"target1": _floor_price(t1, close),
                 "target2": _floor_price(t2, close),
                 "stop":    _floor_price(sl, close)}
@@ -2597,6 +2615,12 @@ def get_price_targets(df, signal, tf="DAY"):
         t1 = sup_levels[0] if sup_levels           else round(close - 1.5 * atr, 2)
         t2 = sup_levels[1] if len(sup_levels) > 1  else round(close - 3.0 * atr, 2)
         sl = res_levels[0] if res_levels           else round(close + 1.0 * atr, 2)
+        # Mirror of the fix above: on a short, T2 must sit BELOW T1 by a
+        # meaningful margin. A support 3.5×ATR down (inside the 4×ATR SL cap)
+        # produced "T1 ₹930 / T2 ₹940" — cover the second half at a worse
+        # price than the first.
+        if t1 - t2 < _MIN_T2_GAP_ATR * atr:
+            t2 = round(t1 - 1.5 * atr, 2)
         return {"target1": _floor_price(t1, close),
                 "target2": _floor_price(t2, close),
                 "stop":    _floor_price(sl, close)}
