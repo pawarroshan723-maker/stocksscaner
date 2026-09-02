@@ -965,6 +965,12 @@ def _cache_last_date(instrument_key, cache_tf):
 _GAP_REPAIR_DONE = set()
 
 
+#: Shortest run of absent consecutive sessions that counts as a hole. Market
+#: closures are isolated (or a two/three-day Diwali cluster); a failed chunk in
+#: a chunked download drops a whole window at once.
+_MIN_GAP_RUN = 5
+
+
 def _cache_missing_days(cached_df, from_d, to_d):
     """
     Trading sessions in [from_d, to_d] that are absent from `cached_df`.
@@ -982,13 +988,43 @@ def _cache_missing_days(cached_df, from_d, to_d):
     except Exception:
         return []
 
-    missing, d, guard = [], from_d, 0
+    # A missing session is only treated as a hole when it forms a LONG
+    # CONTIGUOUS RUN. Two things can legitimately be absent from the cache:
+    #
+    #   • a market closure — isolated, or at most a two/three-day cluster
+    #     around Diwali;
+    #   • a failed chunk in a chunked download — which drops a whole window
+    #     at once, i.e. many consecutive sessions.
+    #
+    # Run length separates them without needing to know the trading calendar,
+    # which matters because NSE_HOLIDAYS only covers the current year. Judging
+    # every absent weekday individually produced 73 phantom gaps on a healthy
+    # 7-year cache — one repair attempt per symbol, every run, forever, chasing
+    # dates the API has no data for.
+    #
+    # Inside the years the calendar does cover we can do better and drop known
+    # holidays before runs are formed, so a run there is unambiguous.
+    covered = _NSE_HOLIDAY_YEARS
+
+    def _flush(run):
+        if len(run) >= _MIN_GAP_RUN:
+            missing.extend(run)
+
+    missing, run = [], []
+    d, guard = from_d, 0
     # Hard cap so a broken calendar helper can never spin forever.
     while d <= to_d and guard < 5000:
-        if _is_trading_day(d) and d not in have:
-            missing.append(d)
+        if d.weekday() >= 5:
+            pass                      # weekend: neither present nor missing
+        elif d.year in covered and not _is_trading_day(d):
+            _flush(run); run = []     # known holiday — not a gap
+        elif d not in have:
+            run.append(d)
+        else:
+            _flush(run); run = []     # present: close any run before it
         d += timedelta(days=1)
         guard += 1
+    _flush(run)
     return missing
 
 

@@ -466,3 +466,89 @@ def test_cache_missing_days_survives_junk(mod):
     assert mod._cache_missing_days(None, None, None) == []
     assert mod._cache_missing_days(pd.DataFrame(), date(2026, 1, 1), date(2026, 2, 1)) == []
     assert mod._cache_missing_days(pd.DataFrame({"ts": []}), date(2026, 2, 1), date(2026, 1, 1)) == []
+
+
+def _weekday_span(days, end):
+    """Every Mon–Fri over `days` calendar days ending at `end`."""
+    start = end - timedelta(days=days)
+    out, d = [], start
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return start, out
+
+
+def test_cache_gap_detector_ignores_isolated_market_closures(mod):
+    """A healthy multi-year cache must report no gaps at all.
+
+    Regression: every absent weekday was judged individually, so with a
+    holiday calendar covering only the current year, ~73 legitimate NSE
+    closures across seven years were reported as holes. Every symbol then
+    logged "CACHE GAP ... still incomplete — one repair attempt per run" and
+    burned an API call chasing dates the exchange never traded.
+    """
+    end = date(2026, 9, 1)
+    start, sessions = _weekday_span(2500, end)
+    # Simulate closures: real ones in covered years, synthetic ones elsewhere
+    # (the detector cannot know about these, which is the whole point).
+    import random
+    rng = random.Random(7)
+    closed = set()
+    for y in range(2019, 2027):
+        if y in mod._NSE_HOLIDAY_YEARS:
+            closed |= {h for h in mod.NSE_HOLIDAYS if h.year == y}
+            continue
+        for _ in range(16):
+            d = date(y, rng.randint(1, 12), rng.randint(1, 28))
+            if d.weekday() < 5:
+                closed.add(d)
+    kept = [s for s in sessions if s not in closed]
+    assert len(closed) > 40, "test needs a realistic number of closures"
+    cache = pd.DataFrame({"ts": pd.to_datetime(kept)})
+    assert mod._cache_missing_days(cache, start, end) == []
+
+
+def test_cache_gap_detector_flags_a_long_contiguous_run(mod):
+    """A failed chunk drops a whole window — that must still be found."""
+    end = date(2026, 9, 1)
+    start, sessions = _weekday_span(400, end)
+    hole = sessions[100:106]
+    pruned = [s for s in sessions if s not in hole]
+    got = mod._cache_missing_days(pd.DataFrame({"ts": pd.to_datetime(pruned)}),
+                                  start, end)
+    assert got == hole
+
+
+def test_cache_gap_detector_ignores_short_holes(mod):
+    """Holes shorter than a failed chunk are deliberately left alone.
+
+    A one-to-four session gap self-heals through the ordinary partial-fetch
+    path (last_cached < effective_to triggers a top-up), so treating it as a
+    hole here would only add false positives around Diwali clusters.
+    """
+    end = date(2026, 9, 1)
+    start, sessions = _weekday_span(400, end)
+    for n in (1, 2, 3, 4):
+        hole = sessions[100:100 + n]
+        pruned = [s for s in sessions if s not in hole]
+        got = mod._cache_missing_days(pd.DataFrame({"ts": pd.to_datetime(pruned)}),
+                                      start, end)
+        assert got == [], "a %d-session hole was flagged" % n
+
+
+def test_cache_gap_detector_excludes_known_holidays_from_runs(mod):
+    """In a covered year a known closure must not extend a run."""
+    end = date(2026, 9, 1)
+    start, sessions = _weekday_span(400, end)
+    known = [h for h in mod.NSE_HOLIDAYS
+             if start <= h <= end and h in sessions]
+    assert known, "need a covered-year holiday inside the window"
+    # Remove the holiday AND the sessions around it; the holiday itself must
+    # not be counted towards the run length.
+    victim = [d for d in sessions
+              if known[0] - timedelta(days=2) <= d <= known[0] + timedelta(days=1)]
+    pruned = [s for s in sessions if s not in victim]
+    got = mod._cache_missing_days(pd.DataFrame({"ts": pd.to_datetime(pruned)}),
+                                  start, end)
+    assert known[0] not in got, "a known market closure was reported as a gap"
