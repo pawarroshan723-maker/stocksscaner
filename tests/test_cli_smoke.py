@@ -177,3 +177,61 @@ def test_every_menu_option_with_corrupt_entry(mod, wired_menu):
     wired_menu[first]["WEEK"] = "totally-corrupt"
     out = _walk(mod, wired_menu, MENU + ["0"])
     assert "Traceback" not in out
+
+
+# ═════════════════════════════════════════════════════════════
+#  DB picker: ENTER must keep the current database
+# ═════════════════════════════════════════════════════════════
+def _install_dated_db(mod, monkeypatch, tmp_path, name="01-09-2026.db"):
+    (tmp_path / name).write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    mod.DB_FILE = name
+    mod.DATA_FILE = name
+
+
+def test_db_picker_enter_keeps_the_current_database(mod, monkeypatch, tmp_path):
+    """ENTER must keep the DB you are already on.
+
+    Regression: the prompt read "ENTER = keep current / default" but the code
+    was `if raw == '' or raw == '0': chosen = 'master_scanner.db'`. Pressing
+    ENTER after loading a dated backup silently switched you to the live scan
+    DB — losing your place, and pointing the next save at a different file
+    than the one you thought you were reading.
+    """
+    _install_dated_db(mod, monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    mod.select_db_file(silent=False)
+    assert mod.DB_FILE == "01-09-2026.db"
+    assert mod.DATA_FILE == "01-09-2026.db"
+
+
+def test_db_picker_zero_still_selects_the_default(mod, monkeypatch, tmp_path):
+    """Option 0 is the explicit way to choose master_scanner.db."""
+    _install_dated_db(mod, monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: "0")
+    mod.select_db_file(silent=False)
+    assert mod.DB_FILE == "master_scanner.db"
+
+
+def test_db_picker_number_selects_that_dated_file(mod, monkeypatch, tmp_path):
+    (tmp_path / "05-08-2026.db").write_bytes(b"")
+    (tmp_path / "01-09-2026.db").write_bytes(b"")   # newest → listed first
+    monkeypatch.chdir(tmp_path)
+    mod.DB_FILE = "master_scanner.db"
+    monkeypatch.setattr("builtins.input", lambda *a: "1")
+    mod.select_db_file(silent=False)
+    assert mod.DB_FILE == "01-09-2026.db"
+
+
+def test_db_picker_invalid_input_keeps_current(mod, monkeypatch, tmp_path):
+    _install_dated_db(mod, monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: "not-a-number")
+    mod.select_db_file(silent=False)
+    assert mod.DB_FILE == "01-09-2026.db"
+
+
+def test_db_picker_out_of_range_keeps_current(mod, monkeypatch, tmp_path):
+    _install_dated_db(mod, monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: "99")
+    mod.select_db_file(silent=False)
+    assert mod.DB_FILE == "01-09-2026.db"

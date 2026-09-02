@@ -959,6 +959,39 @@ def _cache_last_date(instrument_key, cache_tf):
         return None
 
 
+#: (instrument_key, cache_tf) pairs we already tried to repair this process.
+#: Bounds the cost of a range that genuinely has no data (a suspended or
+#: delisted symbol) to one extra fetch per run rather than one per scan.
+_GAP_REPAIR_DONE = set()
+
+
+def _cache_missing_days(cached_df, from_d, to_d):
+    """
+    Trading sessions in [from_d, to_d] that are absent from `cached_df`.
+
+    Returns [] when the window is fully populated. The cost is one set
+    difference over ~1800 dates for a 2500-day lookback — microseconds — and
+    it only runs on the cache-hit path.
+    """
+    if cached_df is None or getattr(cached_df, "empty", True):
+        return []
+    if from_d is None or to_d is None or from_d > to_d:
+        return []
+    try:
+        have = {pd.Timestamp(t).date() for t in cached_df["ts"]}
+    except Exception:
+        return []
+
+    missing, d, guard = [], from_d, 0
+    # Hard cap so a broken calendar helper can never spin forever.
+    while d <= to_d and guard < 5000:
+        if _is_trading_day(d) and d not in have:
+            missing.append(d)
+        d += timedelta(days=1)
+        guard += 1
+    return missing
+
+
 def _cache_last_attempt(instrument_key, cache_tf):
     """
     Last date we ASKED Upstox for, regardless of whether rows came back.
@@ -1042,8 +1075,50 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
     last_tried  = _cache_last_attempt(instrument_key, cache_tf)
 
     if last_cached and last_cached >= effective_to:
-        # ── Full cache hit: no API call needed ───────────────
-        if verbose:
+        # ── Cache reaches the target date ────────────────────
+        #
+        # "Reaches" is not the same as "complete". last_cached is MAX(ts),
+        # which says nothing about what sits in between: a chunked download
+        # that half-failed (a 429 part-way through, a truncated response)
+        # leaves the newest bar in place while punching a hole in the middle.
+        # Every later scan then took this branch, declared a full cache hit,
+        # and never refilled the hole — permanently. Indicators that look back
+        # across the gap (EMA, MACD, RSI, ATR) were computed on a series with
+        # months missing out of the middle, silently.
+        #
+        # So scan the window we hold and repair from the first missing session
+        # forward. INSERT OR IGNORE means re-fetching refills the hole without
+        # disturbing the rows already stored.
+        # Only hunt for holes INSIDE the span we actually hold. Sessions
+        # before the first cached bar are "never published that far back"
+        # (a recent listing), not a failed download — treating them as a gap
+        # would make every short-history symbol refetch on every scan.
+        try:
+            first_cached = pd.Timestamp(cached_df["ts"].min()).date()
+        except Exception:
+            first_cached = None
+        gap_from = full_from if first_cached is None else max(full_from, first_cached)
+        missing = _cache_missing_days(cached_df, gap_from, effective_to)
+        if missing:
+            repair_key = (instrument_key, cache_tf)
+            if repair_key not in _GAP_REPAIR_DONE:
+                _GAP_REPAIR_DONE.add(repair_key)
+                dl_from = missing[0]
+                if verbose:
+                    print("    " + C.DIM + "CACHE GAP [" + cache_tf + "] "
+                          + str(len(missing)) + " session(s) missing from "
+                          + str(missing[0]) + " → repairing" + C.RESET)
+                if dl_from <= effective_to:
+                    new_df = _fetch_range_chunked(instrument_key, unit, value,
+                                                  dl_from, effective_to,
+                                                  headers, verbose)
+                    if not new_df.empty:
+                        _cache_save(instrument_key, cache_tf, new_df)
+                        cached_df = _cache_load(instrument_key, cache_tf)
+            elif verbose:
+                print("    " + C.DIM + "CACHE GAP [" + cache_tf + "] "
+                      "still incomplete — one repair attempt per run" + C.RESET)
+        elif verbose:
             print("    " + C.DIM + "CACHE HIT [" + cache_tf + "] up to "
                   + str(last_cached) + " — skipping API" + C.RESET)
     elif last_tried and last_tried >= effective_to and last_cached:
@@ -1223,6 +1298,23 @@ def as_list(val):
     if isinstance(val, tuple):
         return list(val)
     return []
+
+
+def is_scanned_entry(e):
+    """
+    True when a timeframe entry holds the output of a real scan.
+
+    `empty_entry()` is what every symbol carries before it has ever been
+    scanned (and for timeframes the user has switched off). Its indicator
+    fields are zero-filled — rsi=0.0, volume=0, price=0.0, st_direction=0 —
+    which are *absent* values, not measured ones. Comparing them against
+    thresholds (e.g. `rsi < 20`) manufactures signals out of nothing, so any
+    code that scores or alerts on an entry must check this first.
+
+    A scanned entry always has a non-empty `updated` stamp and a live price.
+    """
+    e = as_dict(e)
+    return bool(e.get("updated")) and safe_float(e.get("price", 0)) > 0
 
 
 def safe_float(val, default=0.0):
@@ -1796,6 +1888,23 @@ def detect_candlestick_patterns(df):
     def _bull(c):     return float(c["close"]) > float(c["open"])
     def _bear(c):     return float(c["close"]) < float(c["open"])
 
+    def _prior_trend_down(n=10):
+        """
+        True when price was FALLING into the current candle, False when it was
+        rising, None when there is not enough history to tell.
+
+        Measured on closes strictly before the pattern candle (index -2 versus
+        index -2-n) so the pattern's own body cannot influence the trend it is
+        being read against.
+        """
+        cl = df["close"].values
+        if len(cl) < n + 2:
+            return None
+        try:
+            return float(cl[-2]) < float(cl[-2 - n])
+        except (TypeError, ValueError):
+            return None
+
     b0, r0, us0, ls0 = _body(c0), _range(c0), _upper_sh(c0), _lower_sh(c0)
     b1, r1 = _body(c1), _range(c1)   # us1/ls1 not needed — c1 shadows unused in patterns
     b2                = _body(c2)
@@ -1810,19 +1919,37 @@ def detect_candlestick_patterns(df):
         else:
             patterns.append("DOJI")
 
-    # Hammer / Hanging Man (same shape, context differs)
+    #
+    # Hammer / Hanging Man — the SAME shape, told apart by the preceding trend.
+    #
+    # Bug fix: this used to split on body colour (`if _bull(c0)`), but colour is
+    # not the discriminator and never was. Per Nison, the identical shape is a
+    # bullish reversal after a decline and a bearish warning after an advance.
+    # Splitting on colour meant:
+    #   • a green hammer at the top of an advance  → labelled HAMMER, so the
+    #     scanner said "bullish reversal" at a high (it is a Hanging Man);
+    #   • a red hammer at the bottom of a decline  → labelled HANGING_MAN, so
+    #     the scanner said "bearish reversal" at a low (it is a Hammer).
+    # Both are sign errors placed exactly at the turning points, where a
+    # reversal read matters most. Verified before the fix: the classification
+    # was byte-identical for a prior uptrend and a prior downtrend.
+    #
+    # When the trend cannot be determined (too little history) we emit nothing
+    # rather than guess: a coin-flip signal is worse than no signal.
+    _trend_down = _prior_trend_down()
+
     if r0 > 0 and b0 > 0 and ls0 >= 2 * b0 and us0 <= 0.3 * b0:
-        if _bull(c0):
+        if _trend_down is True:
             patterns.append("HAMMER")            # bullish reversal
-        else:
+        elif _trend_down is False:
             patterns.append("HANGING_MAN")       # bearish reversal
 
-    # Shooting Star / Inverted Hammer
+    # Shooting Star / Inverted Hammer — same shape, same rule, mirrored.
     if r0 > 0 and b0 > 0 and us0 >= 2 * b0 and ls0 <= 0.3 * b0:
-        if _bear(c0):
-            patterns.append("SHOOTING_STAR")     # bearish reversal
-        else:
+        if _trend_down is True:
             patterns.append("INV_HAMMER")        # bullish reversal
+        elif _trend_down is False:
+            patterns.append("SHOOTING_STAR")     # bearish reversal
 
     # ── 2-candle patterns ─────────────────────────────────────
     if r1 > 0 and r0 > 0:
@@ -3086,6 +3213,16 @@ def gather_alerts(sym, sym_data, tfs=None):
         if tf not in sym_data:
             continue
         e = as_dict(sym_data[tf])
+        # Skip timeframes that have never been scanned.
+        #
+        # Bug fix: empty_entry() carries rsi=0.0, so every unscanned TF tripped
+        # the `rsi < 20` branch below and reported "RSI EXTREME oversold" for
+        # every symbol on the watchlist — three phantom alerts per symbol on a
+        # fresh install, and six per symbol on a partial scan run. The value is
+        # not "measured as 0", it is simply absent, so no alert can be drawn
+        # from it.
+        if not is_scanned_entry(e):
+            continue
         sig = e.get("signal", "NONE")
         vol = safe_float(e.get("volume", 0))
         oi  = safe_float(e.get("oi",     0))
@@ -4296,31 +4433,66 @@ def generate_stock_summary(sym, sym_data, tfs=None):
                 "strong trend recovery underway")
 
     # ── RISK : REWARD ─────────────────────────────────────────
-    if rr >= 2.5:
+    #
+    # Bug fix: this block used to reward the long side only. risk_reward is
+    # always a positive ratio — |T1 - price| / |price - stop| — so a clean
+    # BREAKDOWN produced a healthy number and was then praised as an
+    # "excellent setup" and pushed onto buy_reasons. Every favourable R:R
+    # therefore added a spurious BUY argument to every short, inflating the
+    # score and, in close cases, flipping the verdict to BUY outright.
+    # The praise has to follow the direction of the trade.
+    if rr >= 2.5 and sig == "BREAKOUT":
         buy_reasons.append(
             "Risk:Reward is " + str(rr) + ":1 — excellent setup; "
             "you risk ₹1 to potentially make ₹" + str(rr))
-    elif rr >= 1.5:
+    elif rr >= 2.5 and sig == "BREAKDOWN":
+        sell_reasons.append(
+            "Risk:Reward is " + str(rr) + ":1 — excellent short setup; "
+            "you risk ₹1 to potentially make ₹" + str(rr))
+    elif rr >= 1.5 and sig == "BREAKOUT":
         buy_reasons.append(
             "Risk:Reward is " + str(rr) + ":1 — acceptable setup")
+    elif rr >= 1.5 and sig == "BREAKDOWN":
+        sell_reasons.append(
+            "Risk:Reward is " + str(rr) + ":1 — acceptable short setup")
     elif 0 < rr < 1.5 and sig in ("BREAKOUT", "BREAKDOWN"):
         cautions.append(
             "Risk:Reward is only " + str(rr) + ":1 — "
             "the potential gain does not justify the risk at this entry")
 
     # ── COMPOSITE SCORE ───────────────────────────────────────
-    if cs >= 75:
+    #
+    # Bug fix: the `cs >= 75` branch had no signal guard at all (unlike the
+    # 55 and 30 branches, which did check for BREAKOUT). calc_composite_score
+    # is direction-neutral — it scores conviction, not direction, using
+    # abs(confluence) and symmetric bull/bear point tallies — so a powerful
+    # BREAKDOWN easily clears 75 and was then described as "most indicators
+    # are aligned bullishly" and counted as a BUY argument.
+    if cs >= 75 and sig == "BREAKOUT":
         buy_reasons.append(
             "Composite signal score is " + str(int(cs)) + "/100 — "
             "extremely high multi-factor quality rating; "
             "most indicators are aligned bullishly")
+    elif cs >= 75 and sig == "BREAKDOWN":
+        sell_reasons.append(
+            "Composite signal score is " + str(int(cs)) + "/100 — "
+            "extremely high multi-factor quality rating; "
+            "most indicators are aligned bearishly")
     elif cs >= 55 and sig == "BREAKOUT":
         buy_reasons.append(
             "Composite score of " + str(int(cs)) + "/100 indicates a solid setup "
             "with good indicator confluence")
+    elif cs >= 55 and sig == "BREAKDOWN":
+        sell_reasons.append(
+            "Composite score of " + str(int(cs)) + "/100 indicates a solid "
+            "short setup with good indicator confluence")
     elif cs <= 30 and sig == "BREAKOUT":
         cautions.append(
             "Composite score is low (" + str(int(cs)) + "/100) despite a breakout signal — "
+            "most indicators are NOT confirming; treat with caution")
+    elif cs <= 30 and sig == "BREAKDOWN":
+        cautions.append(
+            "Composite score is low (" + str(int(cs)) + "/100) despite a breakdown signal — "
             "most indicators are NOT confirming; treat with caution")
 
     # ── SUPPORT / RESISTANCE CONTEXT ──────────────────────────
@@ -6965,7 +7137,15 @@ def select_db_file(silent=False):
         return
 
     chosen = None
-    if raw == '' or raw == '0':
+    if raw == '':
+        # Bug fix: ENTER must keep the CURRENT database. It used to fall
+        # through to master_scanner.db, so a user who had loaded a dated
+        # backup (say 01-09-2026.db) and pressed ENTER to keep it was silently
+        # switched to the live scan DB — losing their place and, worse,
+        # pointing the next save at a different file than they expected.
+        # Option 0 is still the explicit way to pick the default.
+        return
+    elif raw == '0':
         chosen = 'master_scanner.db'
     elif raw.isdigit():
         idx = int(raw) - 1

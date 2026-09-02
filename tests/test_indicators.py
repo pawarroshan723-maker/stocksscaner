@@ -328,3 +328,111 @@ def test_safe_float_handles_nan_and_junk(mod):
     assert mod.safe_float("abc", 5.0) == 5.0
     assert mod.safe_float(None, -1.0) == -1.0
     assert mod.safe_float("3.5") == 3.5
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hammer / Hanging Man must be told apart by TREND, not colour
+# ═════════════════════════════════════════════════════════════
+def _pattern_frame(mod, prior_closes, last_bar):
+    """Build an OHLCV frame ending in `last_bar`, preceded by a price path."""
+    import numpy as np
+    import pandas as pd
+    n = len(prior_closes) + 1
+    ts = pd.date_range("2026-01-01", periods=n, freq="D", tz="Asia/Kolkata")
+    o = np.append(prior_closes, last_bar[0])
+    h = np.append(prior_closes, last_bar[1])
+    lo = np.append(prior_closes, last_bar[2])
+    c = np.append(prior_closes, last_bar[3])
+    return pd.DataFrame({"ts": ts, "open": o, "high": h, "low": lo,
+                         "close": c, "vol": 1e5, "oi": 0.0})
+
+
+# Long LOWER shadow, small body near the top → hammer / hanging-man shape.
+LOWER_GREEN = (98.0, 101.0, 91.0, 100.5)
+LOWER_RED   = (100.5, 101.0, 91.0, 98.0)
+# Long UPPER shadow, small body near the bottom → shooting-star / inv-hammer.
+UPPER_GREEN = (99.0, 110.0, 98.9, 101.5)
+UPPER_RED   = (101.5, 110.0, 98.9, 99.0)
+
+ADVANCE  = [80.0 + i * (30.0 / 14) for i in range(15)]   # 80 → 110
+DECLINE  = [110.0 - i * (30.0 / 14) for i in range(15)]  # 110 → 80
+
+
+def test_hammer_shape_after_a_decline_is_a_hammer(mod):
+    """Bullish reversal at a low — regardless of body colour."""
+    for bar in (LOWER_GREEN, LOWER_RED):
+        pats = mod.detect_candlestick_patterns(
+            _pattern_frame(mod, DECLINE, bar))
+        assert "HAMMER" in pats, (bar, pats)
+        assert "HANGING_MAN" not in pats, (bar, pats)
+
+
+def test_hammer_shape_after_an_advance_is_a_hanging_man(mod):
+    """Bearish warning at a high — regardless of body colour.
+
+    Regression: the shape used to be split on body colour alone, so a green
+    hammer at the top of an advance was reported as a bullish HAMMER. The
+    classification was byte-identical for a prior uptrend and a prior
+    downtrend — the trend was never consulted.
+    """
+    for bar in (LOWER_GREEN, LOWER_RED):
+        pats = mod.detect_candlestick_patterns(
+            _pattern_frame(mod, ADVANCE, bar))
+        assert "HANGING_MAN" in pats, (bar, pats)
+        assert "HAMMER" not in pats, (bar, pats)
+
+
+def test_upper_shadow_shape_after_an_advance_is_a_shooting_star(mod):
+    for bar in (UPPER_GREEN, UPPER_RED):
+        pats = mod.detect_candlestick_patterns(
+            _pattern_frame(mod, ADVANCE, bar))
+        assert "SHOOTING_STAR" in pats, (bar, pats)
+        assert "INV_HAMMER" not in pats, (bar, pats)
+
+
+def test_upper_shadow_shape_after_a_decline_is_an_inverted_hammer(mod):
+    for bar in (UPPER_GREEN, UPPER_RED):
+        pats = mod.detect_candlestick_patterns(
+            _pattern_frame(mod, DECLINE, bar))
+        assert "INV_HAMMER" in pats, (bar, pats)
+        assert "SHOOTING_STAR" not in pats, (bar, pats)
+
+
+def test_reversal_pattern_direction_is_independent_of_body_colour(mod):
+    """The same shape must not change its meaning because the body is red/green."""
+    for shape, bull, bear in ((LOWER_GREEN, "HAMMER", "HANGING_MAN"),
+                              (UPPER_GREEN, "INV_HAMMER", "SHOOTING_STAR")):
+        after_decline = mod.detect_candlestick_patterns(
+            _pattern_frame(mod, DECLINE, shape))
+        after_advance = mod.detect_candlestick_patterns(
+            _pattern_frame(mod, ADVANCE, shape))
+        assert bull in after_decline and bear in after_advance
+
+
+def test_reversal_pattern_sign_matches_the_trend(mod):
+    """The bullish label must land after a decline, the bearish after an advance."""
+    mod_fixture = mod
+    assert "HAMMER" in mod_fixture.CANDLE_BULL
+    assert "INV_HAMMER" in mod_fixture.CANDLE_BULL
+    assert "HANGING_MAN" in mod_fixture.CANDLE_BEAR
+    assert "SHOOTING_STAR" in mod_fixture.CANDLE_BEAR
+
+    for bar in (LOWER_GREEN, LOWER_RED, UPPER_GREEN, UPPER_RED):
+        low_pats = mod_fixture.detect_candlestick_patterns(
+            _pattern_frame(mod, DECLINE, bar))
+        high_pats = mod_fixture.detect_candlestick_patterns(
+            _pattern_frame(mod, ADVANCE, bar))
+        assert [p for p in low_pats if p in mod_fixture.CANDLE_BULL], (bar, low_pats)
+        assert [p for p in high_pats if p in mod_fixture.CANDLE_BEAR], (bar, high_pats)
+
+
+def test_reversal_pattern_suppressed_when_trend_is_unknowable(mod):
+    """With too little history, emit nothing rather than guess.
+
+    A coin-flip reversal signal is worse than no signal.
+    """
+    short = [100.0, 101.0, 102.0]
+    for bar in (LOWER_GREEN, LOWER_RED, UPPER_GREEN, UPPER_RED):
+        pats = mod.detect_candlestick_patterns(_pattern_frame(mod, short, bar))
+        assert "HAMMER" not in pats and "HANGING_MAN" not in pats, (bar, pats)
+        assert "SHOOTING_STAR" not in pats and "INV_HAMMER" not in pats, (bar, pats)

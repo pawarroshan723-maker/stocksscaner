@@ -380,3 +380,89 @@ def test_stale_holiday_calendar_warns(mod, monkeypatch, capsys):
     capsys.readouterr()
     mod._warn_stale_holiday_calendar()
     assert capsys.readouterr().out == ""
+
+
+# ── Cache hole repair ────────────────────────────────────────
+def test_cache_repairs_a_hole_in_the_middle(mod, api, monkeypatch):
+    """A partially-failed chunked download must not become a permanent gap.
+
+    Regression: the cache was keyed on MAX(ts), which says nothing about what
+    sits in between. A chunked download that half-failed left the newest bar
+    in place, so every later scan saw `last_cached >= effective_to`, declared
+    a full cache hit, and never refilled the hole — permanently. EMA/MACD/RSI
+    were then computed on a series with months missing out of the middle.
+    """
+    mod._GAP_REPAIR_DONE.clear()
+    full = make_daily_series(n=300, seed=3)
+    api.daily = full
+
+    # Seed a cache that reaches T-1 but is missing 100 sessions in the middle.
+    hole = pd.concat([full.iloc[:100], full.iloc[200:]]).reset_index(drop=True)
+    mod._cache_save(KEY, "DAY", hole)
+    assert mod._cache_last_date(KEY, "DAY") is not None
+
+    out = mod.fetch_historical_cached(KEY, "days", "1", 2500, {},
+                                      verbose=False, cache_tf="DAY")
+    missing = sorted(set(full["ts"]) - set(out["ts"]))
+    assert not missing, "cache still has {0} missing bars".format(len(missing))
+    assert len(out) == len(full)
+
+
+def test_cache_without_a_hole_does_not_refetch(mod, api):
+    """A complete cache must still short-circuit to a plain cache hit.
+
+    The repair scan must not turn every cache hit into a re-download — that
+    would defeat the cache and hammer the API on every scan pass.
+    """
+    mod._GAP_REPAIR_DONE.clear()
+    api.daily = make_daily_series(n=300, seed=5)
+    first = mod.fetch_historical_cached(KEY, "days", "1", 2500, {},
+                                        verbose=False, cache_tf="DAY")
+    assert not first.empty
+    calls_after_first = len(api.calls)
+
+    second = mod.fetch_historical_cached(KEY, "days", "1", 2500, {},
+                                         verbose=False, cache_tf="DAY")
+    assert len(api.calls) == calls_after_first, "complete cache was refetched"
+    assert len(second) == len(first)
+
+
+def test_cache_missing_days_ignores_weekends_and_holidays(mod, api):
+    """_cache_missing_days must only count sessions the exchange actually held."""
+    mod._GAP_REPAIR_DONE.clear()
+    full = make_daily_series(n=200, seed=6)
+    api.daily = full
+    mod.fetch_historical_cached(KEY, "days", "1", 2500, {},
+                                verbose=False, cache_tf="DAY")
+    cached = mod._cache_load(KEY, "DAY")
+    lo = cached["ts"].min().date()
+    hi = cached["ts"].max().date()
+    assert mod._cache_missing_days(cached, lo, hi) == [], \
+        "a freshly downloaded cache reported gaps"
+
+
+def test_cache_missing_days_finds_a_planted_hole(mod, api):
+    mod._GAP_REPAIR_DONE.clear()
+    full = make_daily_series(n=200, seed=7)
+    api.daily = full
+    mod.fetch_historical_cached(KEY, "days", "1", 2500, {},
+                                verbose=False, cache_tf="DAY")
+    cached = mod._cache_load(KEY, "DAY")
+    lo, hi = cached["ts"].min().date(), cached["ts"].max().date()
+
+    # Punch out a 10-session block from the middle.
+    victim = sorted(cached["ts"])[60:70]
+    pruned = cached[~cached["ts"].isin(victim)]
+    missing = mod._cache_missing_days(pruned, lo, hi)
+    # make_daily_series emits business days; _is_trading_day additionally
+    # skips NSE holidays, so a victim date may legitimately not be a session.
+    expected = sorted(pd.Timestamp(d).date() for d in victim
+                      if mod._is_trading_day(pd.Timestamp(d).date()))
+    assert missing == expected
+    assert missing, "no gap detected in a deliberately pruned cache"
+
+
+def test_cache_missing_days_survives_junk(mod):
+    assert mod._cache_missing_days(None, None, None) == []
+    assert mod._cache_missing_days(pd.DataFrame(), date(2026, 1, 1), date(2026, 2, 1)) == []
+    assert mod._cache_missing_days(pd.DataFrame({"ts": []}), date(2026, 2, 1), date(2026, 1, 1)) == []

@@ -444,3 +444,125 @@ def test_no_levels_returns_empty_not_a_flat_dict(mod):
     assert mod.get_price_targets(_flat_df(), "NONE", "DAY") == {}
     empty = _flat_df().iloc[0:0]
     assert mod.get_price_targets(empty, "BREAKOUT", "DAY") == {}
+
+
+# ═════════════════════════════════════════════════════════════
+#  Phantom alerts from unscanned timeframes
+# ═════════════════════════════════════════════════════════════
+def test_unscanned_timeframes_do_not_raise_rsi_alerts(mod):
+    """A symbol that has never been scanned must not generate RSI alerts.
+
+    Regression: empty_entry() carries rsi=0.0, which tripped the `rsi < 20`
+    branch in gather_alerts. Every unscanned TF therefore reported
+    "RSI EXTREME oversold" — three phantom alerts per symbol on a fresh
+    install, and one per disabled TF on a partial scan. 0.0 is not a measured
+    value, it is the absence of one.
+    """
+    data = {}
+    mod.ensure_symbol(data, "NEVERSCANNED")
+    alerts = mod.gather_alerts("NEVERSCANNED", data["NEVERSCANNED"],
+                               ["DAY", "WEEK", "MONTH"])
+    rsi_alerts = [a for a in alerts if "RSI" in a[1]]
+    assert not rsi_alerts, rsi_alerts
+
+
+def test_unscanned_timeframes_raise_no_alerts_at_all(mod):
+    """Same point, wider: an unscanned symbol raises nothing whatsoever."""
+    data = {}
+    mod.ensure_symbol(data, "NEVERSCANNED")
+    assert mod.gather_alerts("NEVERSCANNED", data["NEVERSCANNED"],
+                             ["DAY", "WEEK", "MONTH"]) == []
+
+
+def test_genuinely_oversold_scanned_entry_still_alerts(mod):
+    """The guard must suppress absent values, not real ones.
+
+    A scanned entry with a measured RSI of 10 must still raise the alert.
+    """
+    data = {}
+    mod.ensure_symbol(data, "SCANNED")
+    e = data["SCANNED"]["DAY"]
+    e.update({"rsi": 10.0, "price": 500.0, "updated": "2026-09-02 10:00",
+              "signal": "NONE"})
+    alerts = mod.gather_alerts("SCANNED", data["SCANNED"], ["DAY"])
+    assert any("RSI" in a[1] and "oversold" in a[2] for a in alerts), alerts
+
+
+def test_is_scanned_entry(mod):
+    e = mod.empty_entry()
+    assert mod.is_scanned_entry(e) is False
+    assert mod.is_scanned_entry({}) is False
+    assert mod.is_scanned_entry("nonsense") is False
+    e["updated"] = "2026-09-02 10:00"
+    assert mod.is_scanned_entry(e) is False, "price still zero → not scanned"
+    e["price"] = 500.0
+    assert mod.is_scanned_entry(e) is True
+
+
+# ═════════════════════════════════════════════════════════════
+#  BREAKDOWN must not be argued as a BUY
+# ═════════════════════════════════════════════════════════════
+def _breakdown_entry(mod, **over):
+    e = mod.empty_entry()
+    e.update({"signal": "BREAKDOWN", "price": 1000.0,
+              "composite_score": 82, "risk_reward": 3.0,
+              "rsi": 70.0, "rel_vol": 2.5,
+              "targets": {"target1": 900.0, "target2": 850.0,
+                          "stop": 1100.0}})
+    e.update(over)
+    return e
+
+
+def test_breakdown_does_not_produce_buy_reasons(mod):
+    """A strong short must not be praised in the BUY column.
+
+    Regression: both the risk:reward block and the `cs >= 75` block appended
+    to buy_reasons unconditionally. risk_reward is always a positive ratio, so
+    a clean BREAKDOWN scored 3.0 and earned "excellent setup"; the composite
+    branch had no signal guard at all and declared "most indicators are
+    aligned bullishly" on a short. In a close case that flipped the verdict
+    from SELL to BUY.
+    """
+    s = mod.generate_stock_summary("XYZ", {"DAY": _breakdown_entry(mod)}, ["DAY"])
+    joined = " ".join(s["buy_reasons"]).lower()
+    assert "bullishly" not in joined, s["buy_reasons"]
+    assert "excellent setup" not in joined, s["buy_reasons"]
+    assert "acceptable setup" not in joined, s["buy_reasons"]
+
+
+def test_breakdown_verdict_is_never_buy(mod):
+    s = mod.generate_stock_summary("XYZ", {"DAY": _breakdown_entry(mod)}, ["DAY"])
+    assert s["verdict"] != "BUY"
+
+
+def test_breakdown_favourable_numbers_become_sell_reasons(mod):
+    """The same favourable metrics must be credited to the SHORT side."""
+    s = mod.generate_stock_summary("XYZ", {"DAY": _breakdown_entry(mod)}, ["DAY"])
+    joined = " ".join(s["sell_reasons"]).lower()
+    assert "risk:reward" in joined, s["sell_reasons"]
+    assert "bearishly" in joined or "composite" in joined, s["sell_reasons"]
+
+
+def test_breakout_still_gets_the_buy_arguments(mod):
+    """Mirror check: the fix must not strip the long side of its reasons."""
+    e = _breakdown_entry(mod)
+    e.update({"signal": "BREAKOUT",
+              "targets": {"target1": 1100.0, "target2": 1150.0,
+                          "stop": 900.0}})
+    s = mod.generate_stock_summary("XYZ", {"DAY": e}, ["DAY"])
+    joined = " ".join(s["buy_reasons"]).lower()
+    assert "risk:reward" in joined, s["buy_reasons"]
+    assert "bullishly" in joined, s["buy_reasons"]
+
+
+def test_weak_risk_reward_is_a_caution_on_both_sides(mod):
+    for sig in ("BREAKOUT", "BREAKDOWN"):
+        s = mod.generate_stock_summary("XYZ",
+                                       {"DAY": _breakdown_entry(mod,
+                                                                signal=sig,
+                                                                risk_reward=0.5)},
+                                       ["DAY"])
+        assert any("risk:reward" in c.lower() for c in s["cautions"]), \
+            (sig, s["cautions"])
+        assert not s["buy_reasons"] or "risk:reward" not in \
+            " ".join(s["buy_reasons"]).lower()
