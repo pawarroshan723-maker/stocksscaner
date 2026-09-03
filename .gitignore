@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local virtualenv used for the test suite
+.venv/
+
+# Scratch space used to reconstruct the module after the bytecode-recovery step
+.recovery/
+
+# Generated scanner artefacts
+master_report_*.html
+master_report_*.txt
+master_export_*.csv
+scanner_data.db
+scanner_data_*.db
+upstox_token.json
