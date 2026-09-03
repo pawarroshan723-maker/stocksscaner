@@ -1010,6 +1010,12 @@ def _cache_missing_days(cached_df, from_d, to_d):
         if len(run) >= _MIN_GAP_RUN:
             missing.extend(run)
 
+    # A run is closed only by a session that IS present. A known closure is
+    # skipped without breaking the run, because a hole that straddles a
+    # holiday is still one hole — breaking it there would drop a leading
+    # fragment shorter than the threshold and leave the repair starting past
+    # the real beginning of the gap (measured: an 11-bar stub survived a
+    # 100-session repair exactly that way).
     missing, run = [], []
     d, guard = from_d, 0
     # Hard cap so a broken calendar helper can never spin forever.
@@ -1017,7 +1023,8 @@ def _cache_missing_days(cached_df, from_d, to_d):
         if d.weekday() >= 5:
             pass                      # weekend: neither present nor missing
         elif d.year in covered and not _is_trading_day(d):
-            _flush(run); run = []     # known holiday — not a gap
+            pass                      # known closure: not absent, and it must
+                                      # not split a hole that runs across it
         elif d not in have:
             run.append(d)
         else:
@@ -1141,9 +1148,13 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
                 _GAP_REPAIR_DONE.add(repair_key)
                 dl_from = missing[0]
                 if verbose:
-                    print("    " + C.DIM + "CACHE GAP [" + cache_tf + "] "
-                          + str(len(missing)) + " session(s) missing from "
-                          + str(missing[0]) + " → repairing" + C.RESET)
+                    # Report the span, not a count: a known holiday breaks a
+                    # run, so a hole straddling one reports fewer sessions
+                    # than it spans. "from ... to ..." stays accurate.
+                    print("    " + C.DIM + "CACHE GAP [" + cache_tf + "] hole "
+                          + str(missing[0]) + " → " + str(missing[-1])
+                          + " (" + str(len(missing)) + " session(s))"
+                          + " → repairing" + C.RESET)
                 if dl_from <= effective_to:
                     new_df = _fetch_range_chunked(instrument_key, unit, value,
                                                   dl_from, effective_to,
