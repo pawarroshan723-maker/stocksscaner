@@ -599,3 +599,73 @@ def test_export_html_escapes_custom_symbol_and_sector_names(mod, monkeypatch, tm
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html   # shown, but escaped
     # nav href and card id must use the SAME esc() text so anchors still match
     assert 'href="#sym-' in html and 'id="sym-' in html
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Stale intraday history detection
+#  (Upstox can publish the minutes/hours candles of the latest session
+#  later than the daily ones — 5MIN/1HR closes then disagree with DAY
+#  with no error anywhere; observed live: ₹1205.7 vs ₹1220.0.)
+# ═══════════════════════════════════════════════════════════════
+
+def _stale_entry(mod, price, cdate, signal="BREAKOUT"):
+    e = mod.empty_entry()
+    e.update({"price": price, "candle_date": cdate, "signal": signal,
+              "updated": cdate})
+    return e
+
+
+def _stale_data(mod, day_px=1000.0, day_date="2026-10-28 00:00",
+                m5_px=1000.0, m5_date="2026-10-28 15:25"):
+    return {"ALPHA": {
+        "symbol": "ALPHA",
+        "DAY":  _stale_entry(mod, day_px, day_date),
+        "5MIN": _stale_entry(mod, m5_px, m5_date),
+    }}
+
+
+def test_stale_warning_when_intraday_close_drifts_from_day(mod, monkeypatch):
+    monkeypatch.setattr(mod, "is_market_open", lambda: False)
+    warns = mod._stale_intraday_warnings(
+        "ALPHA", _stale_data(mod, m5_px=985.0), ["DAY", "5MIN"])
+    assert len(warns) == 1
+    assert "5MIN" in warns[0] and "off" in warns[0]
+
+
+def test_stale_warning_when_intraday_date_lags_day(mod, monkeypatch):
+    monkeypatch.setattr(mod, "is_market_open", lambda: False)
+    # price identical, but the minute history ends a session earlier
+    warns = mod._stale_intraday_warnings(
+        "ALPHA", _stale_data(mod, m5_date="2026-10-27 15:25"),
+        ["DAY", "5MIN"])
+    assert len(warns) == 1
+    assert "history ends 2026-10-27" in warns[0]
+
+
+def test_no_stale_warning_when_data_agrees(mod, monkeypatch):
+    monkeypatch.setattr(mod, "is_market_open", lambda: False)
+    # 0.1% is inside the tolerance; same session date
+    assert mod._stale_intraday_warnings(
+        "ALPHA", _stale_data(mod, m5_px=999.0), ["DAY", "5MIN"]) == []
+
+
+def test_no_stale_warning_while_market_open(mod, monkeypatch):
+    monkeypatch.setattr(mod, "is_market_open", lambda: True)
+    assert mod._stale_intraday_warnings(
+        "ALPHA", _stale_data(mod, m5_px=900.0), ["DAY", "5MIN"]) == []
+
+
+def test_no_stale_warning_without_day_this_pass(mod, monkeypatch):
+    monkeypatch.setattr(mod, "is_market_open", lambda: False)
+    # intraday-only scan (option 2 with 5MIN,1HR): no DAY row to compare
+    assert mod._stale_intraday_warnings(
+        "ALPHA", _stale_data(mod, m5_px=900.0), ["5MIN"]) == []
+
+
+def test_resampled_tfs_never_flagged(mod, monkeypatch):
+    monkeypatch.setattr(mod, "is_market_open", lambda: False)
+    data = _stale_data(mod)
+    data["ALPHA"]["WEEK"] = _stale_entry(mod, 500.0, "Wk 2026-10-26")
+    data["ALPHA"]["MONTH"] = _stale_entry(mod, 400.0, "Mo 2026-10")
+    assert mod._stale_intraday_warnings(
+        "ALPHA", data, ["DAY", "5MIN", "WEEK", "MONTH"]) == []

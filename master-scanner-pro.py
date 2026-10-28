@@ -776,7 +776,8 @@ def fetch_historical(instrument_key, unit, value, lookback_days, headers, verbos
     Bug 1 — to_date on weekend (critical for minutes/hours):
       Old code: yesterday = date.today() - 1 day (raw).
       On Mondays that produces Sunday → Upstox returns HTTP 400 / empty for
-      minute-level data.  Fixed: to_date = _last_trading_day(today - 1),
+      minute-level data (Upstox caps minutes ranges at 30 calendar days —
+      see _HIST_MAX_DAYS).  Fixed: to_date = _last_trading_day(today - 1),
       i.e. Friday when today is Monday.
 
     Bug 2 — from_date on weekend:
@@ -785,9 +786,9 @@ def fetch_historical(instrument_key, unit, value, lookback_days, headers, verbos
       so the API range always starts on a valid trading session.
 
     Bug 3 — no chunking for long intraday lookbacks:
-      Upstox caps minute historical calls at 15 calendar days each, hours at 90 days.
+      Upstox caps minute historical calls at 30 calendar days each, hours at 90 days.
       When lookback_days exceeds _HIST_MAX_DAYS[unit] the function splits the range
-      into max_span-day chunks (15 for minutes, 90 for hours), fetches each chunk
+      into max_span-day chunks (30 for minutes, 90 for hours), fetches each chunk
       separately, and concatenates the results.
     """
     to_d_obj   = _last_trading_day(_today_ist() - timedelta(days=1))
@@ -3409,6 +3410,50 @@ def header(title="MASTER SCANNER v8.0 PRO"):
 #  All scan paths (auto_scan, scan_single_symbol) funnel here.
 # ─────────────────────────────────────────────────────────────
 
+def _stale_intraday_warnings(sym, data, use_tfs):
+    """Flag intraday TF rows whose data lags the DAY row of the same scan.
+
+    When the market is shut, every TF must describe the SAME last session:
+    the minutes/hours history, the daily history and the (empty) live merge
+    all end at the same close — empirically identical to the paisa when the
+    data is complete.  Upstox can publish the minutes/hours candles of the
+    latest session later than the daily ones; the scanner then shows
+    5MIN/1HR closes that quietly disagree with DAY and nothing else reports
+    it.  Two checks, both market-closed only and only when DAY was scanned
+    in this pass:
+      * intraday candle_date's day-part older than DAY's  → stale
+      * intraday close off DAY's close by more than 0.2% → stale
+    WEEK/MONTH are excluded: they are resampled from DAY itself.
+
+    Returns a list of human-readable warning strings (empty = looks fine).
+    """
+    if is_market_open() or "DAY" not in use_tfs:
+        return []
+    day = as_dict(as_dict(data.get(sym)).get("DAY"))
+    day_date = str(day.get("candle_date") or "")[:10]
+    day_px   = safe_float(day.get("price"), 0)
+    if not day_date or day_px <= 0:
+        return []
+    warns = []
+    for tf in use_tfs:
+        if tf not in TF_INTRADAY_V3 or tf == "DAY" or tf in RESAMPLE_TFS:
+            continue
+        e  = as_dict(as_dict(data.get(sym)).get(tf))
+        cd = str(e.get("candle_date") or "")
+        tf_date = cd[:10]
+        tf_px   = safe_float(e.get("price"), 0)
+        if tf_date and tf_date < day_date:
+            warns.append(tf + " history ends " + tf_date + " but DAY is "
+                         + day_date + " — intraday data is stale; re-scan later.")
+        elif tf_px > 0 and abs(tf_px - day_px) / day_px > 0.002:
+            off = abs(tf_px - day_px) / day_px * 100
+            warns.append(tf + " close ₹" + str(round(tf_px, 2)) + " vs DAY ₹"
+                         + str(round(day_px, 2)) + " (" + str(round(off, 2))
+                         + "% off) — intraday history may be incomplete; "
+                         "re-scan later.")
+    return warns
+
+
 def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
     """
     Download candles, compute indicators, detect signals, and store
@@ -3617,6 +3662,13 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
     # so conf_raw=1 instead of 6. Now all TFs are in data[sym] — recompute
     # with the full picture. Also log_history here so it records the FINAL
     # accurate score, not the intermediate one from inside the loop.
+    # Surface intraday history that silently lags the daily bar: the
+    # Upstox minutes/hours endpoints have been observed to publish the
+    # latest session later than the daily one, so 5MIN/1HR closes then
+    # disagree with DAY (e.g. ₹1205.7 vs ₹1220.0) with no error shown.
+    for _msg in _stale_intraday_warnings(sym, data, use_tfs):
+        cprint("    ⚠ " + _msg, C.YELLOW)
+
     for tf in use_tfs:
         if tf not in data[sym]:
             continue
@@ -7355,7 +7407,10 @@ def main_menu_loop(data, tfs):
         # ══════════════════════════════════════════════════════
         mkt_status = (C.GREEN + "● MARKET OPEN" if is_market_open()
                       else C.RED + "● MARKET CLOSED") + C.RESET
-        cprint("  MENU" + "  " * 28 + mkt_status, C.WHITE, bold=True)
+        # Pad must keep the line inside W (74): "  MENU" + pad + "● MARKET
+        # CLOSED" = 77 cols with the old 28-wide pad, which wrapped the header
+        # in a W-wide terminal and pushed the divider onto its tail.
+        cprint("  MENU" + "  " * 26 + mkt_status, C.WHITE, bold=True)
         div("─", W)
 
         print("  " + C.CYAN + C.BOLD + "── SCAN ──────────────────────────────────────────────────────────" + C.RESET)

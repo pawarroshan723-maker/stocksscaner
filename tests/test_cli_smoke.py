@@ -248,3 +248,18 @@ def test_divergence_screen_survives_junk_price_and_corrupt_row(mod, wired_menu):
     wired_menu[first]["WEEK"] = "totally-corrupt"
     out = _walk(mod, wired_menu, ["D", "0"])
     assert "Traceback" not in out
+
+
+def test_menu_status_line_fits_terminal_width(mod, scanned):
+    """Regression: the MENU header was 77 visible cols ("  MENU" + 28 pads +
+    "● MARKET CLOSED") against W=74 — it wrapped in a W-wide terminal and the
+    divider line visually attached to its tail."""
+    data, _ = scanned
+    out = _walk(mod, data, ["0"])
+    menu_lines = [ln for ln in out.splitlines()
+                  if "MENU" in ln and "MARKET" in ln]
+    assert menu_lines, "menu status line not rendered"
+    for ln in menu_lines:
+        assert mod._vlen(ln) <= mod.W, \
+            "menu status line is {} cols (W={}): {!r}".format(
+                mod._vlen(ln), mod.W, ln)
