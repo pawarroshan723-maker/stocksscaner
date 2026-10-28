@@ -235,3 +235,16 @@ def test_db_picker_out_of_range_keeps_current(mod, monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda *a: "99")
     mod.select_db_file(silent=False)
     assert mod.DB_FILE == "01-09-2026.db"
+
+
+def test_divergence_screen_survives_junk_price_and_corrupt_row(mod, wired_menu):
+    """Menu option D formatted int(price) raw and read entry[tf_key]
+    without coercion — 'junk' price or a scalar TF row killed the loop."""
+    first = sorted(wired_menu)[0]
+    e = mod.empty_entry()
+    e.update({"price": "junk", "signal": "BREAKOUT",
+              "rsi_divergence": {"regular_bull": True}})
+    wired_menu[first]["DAY"] = e
+    wired_menu[first]["WEEK"] = "totally-corrupt"
+    out = _walk(mod, wired_menu, ["D", "0"])
+    assert "Traceback" not in out
