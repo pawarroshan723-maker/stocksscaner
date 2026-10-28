@@ -212,15 +212,21 @@ def main():
         report(PASS if not nonnum else FAIL, "OHLC are numbers",
                "{} bad rows".format(len(nonnum)) if nonnum else "")
 
-        # OHLC sanity
-        ohlc_bad = 0
-        for c in candles:
-            ts, o, h, l, cl, vol, oi = c
-            if not (h >= max(o, cl) and l <= min(o, cl)) or min(o, h, l, cl) <= 0:
-                ohlc_bad += 1
-        report(PASS if ohlc_bad == 0 else FAIL, "OHLC internally consistent",
-               "high>=max(o,c), low<=min(o,c), all>0"
-               if not ohlc_bad else "{} bad rows".format(ohlc_bad))
+        # OHLC sanity — skip when the row shape is already broken: unpacking
+        # a ≠7-field candle raised ValueError and aborted the report right
+        # after it flagged the field-count failure.
+        if widths == {7}:
+            ohlc_bad = 0
+            for c in candles:
+                ts, o, h, l, cl, vol, oi = c
+                if not (h >= max(o, cl) and l <= min(o, cl)) or min(o, h, l, cl) <= 0:
+                    ohlc_bad += 1
+            report(PASS if ohlc_bad == 0 else FAIL, "OHLC internally consistent",
+                   "high>=max(o,c), low<=min(o,c), all>0"
+                   if not ohlc_bad else "{} bad rows".format(ohlc_bad))
+        else:
+            report(SKIP, "OHLC internally consistent",
+                   "row shape already flagged above")
 
         # order (docs' samples are newest-first; the code sorts regardless)
         ts_list = [c[0] for c in candles]
@@ -380,11 +386,13 @@ def main():
         EXPECTED_MIN_GAP))
     statuses, gaps = {}, []
     t_prev = None
+    last_headers = None
     for i in range(25):
         t0 = time.time()
         try:
             r, dt = api("/v3/historical-candle/{}/days/1/{}/{}".format(
                 key.replace("|", "%7C"), to_d, from_d))
+            last_headers = r.headers
             statuses[r.status_code] = statuses.get(r.status_code, 0) + 1
             if r.status_code == 429:
                 print("     429 at request {} — Retry-After: {}".format(
@@ -406,9 +414,13 @@ def main():
 
     hdr = {"x-ratelimit-remaining", "ratelimit-remaining",
            "x-ratelimit-limit", "x-ratelimit-used"}
-    seen = {k: v for k, v in r.headers.items() if k.lower() in hdr}
+    seen = ({k: v for k, v in last_headers.items() if k.lower() in hdr}
+            if last_headers is not None else {})
     if seen:
         report(PASS, "rate-limit headers present", str(seen))
+    elif last_headers is None:
+        report(SKIP, "rate-limit headers",
+               "every rate-limit request failed — no headers observed")
     else:
         report(SKIP, "rate-limit headers",
                "Upstox does not expose them; the scanner counts requests itself")

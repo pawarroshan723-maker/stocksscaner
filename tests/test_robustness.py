@@ -534,3 +534,68 @@ def test_candle_pattern_list_with_non_str_items(mod):
                 fn()
             except Exception as exc:
                 pytest.fail("{} crashed on non-str pattern items: {!r}".format(name, exc))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  select_db_file: loose _DATE_DB_RE + strict strptime
+#  (a file named "31-02-2026.db" matched the regex, then the sort key
+#   raised ValueError — crashing the app at STARTUP before any screen)
+# ═══════════════════════════════════════════════════════════════
+
+def test_select_db_file_survives_impossible_date_names(mod, monkeypatch, tmp_path):
+    import io, sys
+    from contextlib import redirect_stdout
+    for fname in ("31-02-2026.db", "99-99-9999.db", "13-13-2026.db", "01-09-2026.db"):
+        (tmp_path / fname).write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: "")   # ENTER → keep current
+    monkeypatch.setattr(mod, "DB_FILE", "master_scanner.db")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.select_db_file(silent=True)          # must not raise ValueError
+    out = buf.getvalue()
+    assert "01-09-2026.db" in out                # valid backup still listed
+    assert "31-02-2026.db" not in out            # impossible dates skipped
+
+
+def test_select_db_file_startup_empty_dir_is_quiet(mod, monkeypatch, tmp_path):
+    import io
+    from contextlib import redirect_stdout
+    monkeypatch.chdir(tmp_path)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.select_db_file(silent=True)
+    assert buf.getvalue() == ""                  # silent=True prints nothing
+
+
+# ═══════════════════════════════════════════════════════════════
+#  export_html: custom symbol/sector names are free-text user input
+#  (add_custom_symbol) yet the side nav, detail-card id and sector
+#  cells interpolated them RAW while every table cell used esc())
+# ═══════════════════════════════════════════════════════════════
+
+def test_export_html_escapes_custom_symbol_and_sector_names(mod, monkeypatch, tmp_path):
+    import io, glob, os
+    from contextlib import redirect_stdout
+    monkeypatch.chdir(tmp_path)   # report file lands in tmp, not the repo
+    evil_sym = '</div><script>alert(1)</script>'
+    e = mod.empty_entry()
+    e.update({"price": 100.0, "signal": "BREAKOUT", "composite_score": 70,
+              "updated": "2026-09-02 10:00"})
+    data = {evil_sym: {"symbol": evil_sym, "DAY": e}}
+    monkeypatch.setitem(mod.SECTOR_MAP, evil_sym, '<img src=x onerror=alert(2)>')
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.export_html(data, ["DAY"])
+    # export_html prints "✓ HTML saved → <file>"; read the newest report
+    files = sorted(glob.glob("master_report_*.html"), key=os.path.getmtime)
+    assert files, buf.getvalue()
+    html = open(files[-1], encoding="utf-8").read()
+    os.remove(files[-1])
+    raw_sym = "</div><script>alert(1)</script>"
+    raw_sec = "<img src=x onerror=alert(2)>"
+    assert raw_sym not in html, "custom symbol interpolated raw into report"
+    assert raw_sec not in html, "custom sector interpolated raw into report"
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html   # shown, but escaped
+    # nav href and card id must use the SAME esc() text so anchors still match
+    assert 'href="#sym-' in html and 'id="sym-' in html

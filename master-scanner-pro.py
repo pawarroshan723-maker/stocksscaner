@@ -5635,7 +5635,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="nav"><div class="nav-title">Symbols</div>')
     for sym, e in ranked:
         sig = as_dict(e.get("DAY")).get("signal", "NONE")
-        w('<a href="#sym-' + sym + '" class="' + sc(sig) + '">' + sym + '</a>')
+        w('<a href="#sym-' + esc(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
     w('</div>')
 
     w('<div class="wrap">')
@@ -5645,7 +5645,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="card gr"><div class="card-lbl">Breakout (Day)</div><div class="card-val">' + str(bo_d) + '</div><div class="card-sub">' + str(round(bo_d/max(len(data),1)*100)) + '% of universe</div></div>')
     w('<div class="card re"><div class="card-lbl">Breakdown (Day)</div><div class="card-val">' + str(bd_d) + '</div><div class="card-sub">' + str(round(bd_d/max(len(data),1)*100)) + '% of universe</div></div>')
     w('<div class="card ye"><div class="card-lbl">All-TF Breakout</div><div class="card-val">' + str(len(all_bo_syms)) + '</div><div class="card-sub">' + ', '.join(tfs) + ' aligned</div></div>')
-    w('<div class="card bl"><div class="card-lbl">All-TF Breakdown</div><div class="card-val">' + str(len(all_bd_syms)) + '</div><div class="card-sub">' + (', '.join(all_bd_syms[:3]) or 'None') + '</div></div>')
+    w('<div class="card bl"><div class="card-lbl">All-TF Breakdown</div><div class="card-val">' + str(len(all_bd_syms)) + '</div><div class="card-sub">' + (', '.join(esc(s) for s in all_bd_syms[:3]) or 'None') + '</div></div>')
     w('</div>')
 
     # ── SECTOR HEATMAP + BEST SETUPS ─────────────────────────
@@ -5660,7 +5660,7 @@ tr:last-child td{border-bottom:none}
         hbo = max(int(c["BO"]/tot*40), 2 if c["BO"] else 0)
         hbd = max(int(c["BD"]/tot*40), 2 if c["BD"] else 0)
         hsw = max(int(c["SW"]/tot*40), 2 if c["SW"] else 0)
-        w('<div class="sec-cell"><div class="sec-name">' + sec + '</div>')
+        w('<div class="sec-cell"><div class="sec-name">' + esc(sec) + '</div>')
         w('<div class="sec-bars">')
         if c["BO"]: w('<div class="sec-bar" style="height:' + str(hbo) + 'px;background:var(--gr);opacity:.85"></div>')
         if c["BD"]: w('<div class="sec-bar" style="height:' + str(hbd) + 'px;background:var(--re);opacity:.85"></div>')
@@ -5749,7 +5749,7 @@ tr:last-child td{border-bottom:none}
         day_e   = as_dict(e.get("DAY"))
         price   = safe(day_e.get("price",0))
 
-        w('<div class="det-card" id="sym-' + sym + '">')
+        w('<div class="det-card" id="sym-' + esc(sym) + '">')
         w('<div class="det-hdr">')
         w('  <div>')
         w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:13px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
@@ -7219,12 +7219,25 @@ def select_db_file(silent=False):
     """
     global DB_FILE, DATA_FILE
 
-    # Collect & sort dated DB files (newest date first)
+    # Collect & sort dated DB files (newest date first).
+    # Bug fix: _DATE_DB_RE only checks the digit pattern, so a file like
+    # "31-02-2026.db" or "99-99-9999.db" (typo/renamed backup) passed the
+    # regex and strptime() raised ValueError — crashing the app at startup
+    # (silent=True) before a single screen was drawn.  Unparseable names are
+    # simply not valid dated backups, so skip them instead of dying.
+    def _parse_dated_db(f):
+        try:
+            return datetime.strptime(f[:-3], '%d-%m-%Y')
+        except ValueError:
+            return None
+
     dated = sorted(
-        [f for f in os.listdir('.') if _DATE_DB_RE.match(f)],
-        key=lambda f: datetime.strptime(f[:-3], '%d-%m-%Y'),
+        [(f, d) for f in os.listdir('.') if _DATE_DB_RE.match(f)
+         for d in [_parse_dated_db(f)] if d is not None],
+        key=lambda t: t[1],
         reverse=True
     )
+    dated = [f for f, _d in dated]
 
     if not dated:
         # Bug fix: only show the warning when called interactively from the
