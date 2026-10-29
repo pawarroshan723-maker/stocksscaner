@@ -6336,7 +6336,18 @@ def calc_next_day_gap_score(sym_data):
         # Scale: ±3 intraday TFs → ±8 pts (less influential than swing ±18)
         intra_pts = round(intra_raw / max(len(intra_sigs), 1) * 8)
         if intra_pts != 0:
-            i_dir = "bullish" if intra_pts > 0 else "bearish"
+            # Count BOTH sides — same fix as the swing-confluence label above.
+            # The net score alone labelled 2 breakouts + 1 breakdown as simply
+            # "bullish", hiding the opposing intraday vote that the signal
+            # snapshot shows a few lines higher (e.g. 5MIN/15MIN BO, 1HR BD).
+            i_bo = sum(1 for s in intra_sigs if str(s) == "BREAKOUT")
+            i_bd = sum(1 for s in intra_sigs if str(s) == "BREAKDOWN")
+            if i_bo and not i_bd:
+                i_dir = "bullish"
+            elif i_bd and not i_bo:
+                i_dir = "bearish"
+            else:
+                i_dir = "mixed (%d BO / %d BD)" % (i_bo, i_bd)
             raw += intra_pts
             facts.append(("Intraday (" + "/".join(tfs_intra) + ") " + i_dir, intra_pts))
 

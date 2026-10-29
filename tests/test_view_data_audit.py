@@ -192,3 +192,31 @@ def test_trade_plan_direction_matches_verdict(mod, capsys, monkeypatch):
     assert b.group(1) == "BREAKOUT", f"plan recommends {b.group(1)} under a BUY verdict"
     assert b.group(2) == "DAY"
     assert "opposite side" not in out   # fallback warning not needed here
+
+
+# ── 7. intraday gap fact counts both sides ──────────────────
+def test_gap_intraday_label_counts_breakouts_and_breakdowns(mod):
+    """2 intraday BOs + 1 BD must not be labelled plain 'bullish'.
+
+    TECHM (29 Oct 2026 15:28 IST): 5MIN/15MIN BREAKOUT, 1HR BREAKDOWN →
+    net +1 → round(1/3*8) = +3 pts printed as 'Intraday … bullish' while
+    the signal snapshot a few lines up showed the 1HR BREAKDOWN.
+    Weighting (net × 8/3) is unchanged — only the label gains the counts.
+    """
+    data = {
+        "DAY":  {"price": 100.0, "rsi": 60.0},
+        "5MIN": {"signal": "BREAKOUT"},
+        "15MIN": {"signal": "BREAKOUT"},
+        "1HR":  {"signal": "BREAKDOWN"},
+    }
+    _score, _bias, facts = mod.calc_next_day_gap_score(data)
+    intra = [(l, p) for l, p in facts if l.startswith("Intraday (5MIN/15MIN/1HR)")]
+    assert len(intra) == 1, facts
+    label, pts = intra[0]
+    assert "mixed (2 BO / 1 BD)" in label, label   # was "… bullish"
+    assert pts == 3                               # rounding unchanged
+    # pure-consensus labels stay simple
+    data2 = dict(data, **{"1HR": {"signal": "BREAKOUT"}})
+    _s2, _b2, f2 = mod.calc_next_day_gap_score(data2)
+    l2 = next(l for l, _ in f2 if l.startswith("Intraday ("))
+    assert l2.endswith("bullish"), l2
