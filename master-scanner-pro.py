@@ -1653,21 +1653,27 @@ def calc_support_resistance(df, lookback=30):
     highs        = recent["high"]
     lows         = recent["low"]
 
-    # Swing highs above current price only → resistance
+    # Swing highs above current price only → resistance.
+    # Bug fix: the top-3 slice kept the three FARTHEST swings (descending
+    # order), so whenever more than 3 swing highs existed the NEAREST one —
+    # the very level get_price_targets uses for T1 — was dropped from the
+    # displayed list. Keep the three closest-to-price levels instead.
     resistance = sorted(set(
         round(h, 2) for i, h in enumerate(highs)
         if i > 0 and i < len(highs)-1
         and h == highs.iloc[max(0,i-2):i+3].max()
         and h > current_price           # must be above price to be resistance
-    ), reverse=True)[:3]
+    ))[:3]
 
-    # Swing lows below current price only → support
+    # Swing lows below current price only → support (nearest three first —
+    # same fix: an ascending slice used to keep the three farthest and drop
+    # the nearest level, which is the one shown as the SL in trade plans).
     support = sorted(set(
         round(l, 2) for i, l in enumerate(lows)
         if i > 0 and i < len(lows)-1
         and l == lows.iloc[max(0,i-2):i+3].min()
         and l < current_price           # must be below price to be support
-    ))[:3]
+    ), reverse=True)[:3]
 
     return support, resistance
 
@@ -4136,8 +4142,14 @@ def view_detail(sym, data):
     print("  Score  : " + gb_col + C.BOLD + str(gap_score) + "%" + C.RESET +
           "  " + bar_str +
           "  " + gb_col + C.BOLD + gb_str + C.RESET)
-    # Top 3 factors
-    sorted_facts = sorted(gap_facts, key=lambda x: abs(x[1]), reverse=True)[:3]
+    # Every non-zero factor, largest impact first. Bug fix: this used to be
+    # "Top 3 factors", but the score is computed from ALL of them — the
+    # printed points summed to a different raw value than the one actually
+    # scored (e.g. 18 vs 24 → listed factors implied 61% while the header
+    # showed 65%), making correct arithmetic look wrong.
+    sorted_facts = sorted(
+        (f for f in gap_facts if safe_float(f[1]) != 0),
+        key=lambda x: abs(safe_float(x[1])), reverse=True)
     for lbl, pts in sorted_facts:
         col = C.GREEN if pts > 0 else (C.RED if pts < 0 else C.DIM)
         print("  " + col + ("+" if pts >= 0 else "") + str(pts) + "pts" + C.RESET +
@@ -4550,13 +4562,18 @@ def generate_stock_summary(sym, sym_data, tfs=None):
 
     # ── EMA ALIGNMENT ─────────────────────────────────────────
     if "FULL BULL" in ema_aln:
+        # Structural wording only: the FULL BULL/BEAR labels assert the
+        # EMA-to-EMA ORDER (EMA9/21/50/200 crossovers), not where price sits
+        # versus every average — e.g. a FULL BEAR stack can still trade above
+        # its own EMA50, so "price below all key EMAs / every MA resisting
+        # above price" was simply false (contradicted the per-TF reasons).
         buy_reasons.append(
             "EMA stack is fully bullish (EMA9 > EMA21 > EMA50 > EMA200) — "
-            "price is above all key moving averages; the trend is unambiguously up")
+            "the trend structure is unambiguously up")
     elif "FULL BEAR" in ema_aln:
         sell_reasons.append(
-            "EMA stack is fully bearish (price below all key EMAs) — "
-            "every moving average is acting as resistance above price")
+            "EMA stack is fully bearish (EMA9 < EMA21 < EMA50 < EMA200) — "
+            "the trend structure is down; rallies tend to stall under the descending averages")
     elif "BULLISH" in ema_aln:
         buy_reasons.append(
             "EMA alignment is bullish — short-term average is above medium-term; "
@@ -4637,18 +4654,39 @@ def generate_stock_summary(sym, sym_data, tfs=None):
         f618 = safe_float(fib.get("fib_61.8", 0))
         sw_h = safe_float(fib.get("sw_high",  0))
         sw_l = safe_float(fib.get("sw_low",   0))
-        for pct_lbl, lvl in [("38.2%", f382), ("50.0%", f500), ("61.8%", f618)]:
-            if lvl and abs(price - lvl) / max(price, 0.01) < 0.025:
-                if sig == "BREAKOUT":
-                    buy_reasons.append(
-                        "Price is bouncing off the " + pct_lbl +
-                        " Fibonacci retracement (₹" + str(lvl) +
-                        ") — a textbook pullback-to-fib buy zone")
-                else:
-                    cautions.append(
-                        "Price is near the " + pct_lbl +
-                        " Fibonacci level (₹" + str(lvl) +
-                        ") — key decision zone; watch for rejection or breakout")
+        near_fibs = [(lbl, lvl) for lbl, lvl in
+                     [("38.2%", f382), ("50.0%", f500), ("61.8%", f618)]
+                     if lvl and abs(price - lvl) / max(price, 0.01) < 0.025]
+        if len(near_fibs) == 1:
+            pct_lbl, lvl = near_fibs[0]
+            if sig == "BREAKOUT":
+                buy_reasons.append(
+                    "Price is bouncing off the " + pct_lbl +
+                    " Fibonacci retracement (₹" + str(lvl) +
+                    ") — a textbook pullback-to-fib buy zone")
+            else:
+                cautions.append(
+                    "Price is near the " + pct_lbl +
+                    " Fibonacci level (₹" + str(lvl) +
+                    ") — key decision zone; watch for rejection or breakout")
+        elif near_fibs:
+            # Several fib levels clustered around price (within 2.5% each):
+            # credit the whole retracement zone ONCE. The old per-level loop
+            # counted the same zone twice — "bouncing off 50% AND 61.8%" can
+            # never both be true — inflating buy/caution factor counts.
+            zone_lbl = "–".join(lbl for lbl, _ in near_fibs)   # 38.2 > 50 > 61.8 in price
+            zone_txt = "₹" + str(min(l for _, l in near_fibs)) + "–₹" + \
+                       str(max(l for _, l in near_fibs))
+            if sig == "BREAKOUT":
+                buy_reasons.append(
+                    "Price is inside the Fibonacci retracement buy zone (" +
+                    zone_lbl + ": " + zone_txt +
+                    ") — a textbook pullback-to-fib support zone")
+            else:
+                cautions.append(
+                    "Price is inside the key Fibonacci zone (" +
+                    zone_lbl + ": " + zone_txt +
+                    ") — decision zone; watch for rejection or breakout")
         if sw_h and price >= sw_h * 0.99:
             cautions.append(
                 "Price is near the swing high (₹" + str(sw_h) +
@@ -6240,13 +6278,25 @@ def calc_next_day_gap_score(sym_data):
     # ── 2. Multi-TF signal confluence ────────────────────────
     # Swing TF confluence (DAY/WEEK/MONTH) carries the most weight for next-day gaps.
     tfs_all   = ["DAY", "WEEK", "MONTH"]
-    conf_raw  = sum({"BREAKOUT":1,"BREAKDOWN":-1}.get(
-                    str(as_dict(sym_data.get(tf)).get("signal","NONE")), 0)
-                    for tf in tfs_all)
+    swing_sig = [str(as_dict(sym_data.get(tf)).get("signal", "NONE"))
+                 for tf in tfs_all]
+    bo_n      = sum(1 for s in swing_sig if s == "BREAKOUT")
+    bd_n      = sum(1 for s in swing_sig if s == "BREAKDOWN")
+    conf_raw  = bo_n - bd_n              # unchanged weighting: -3..+3
     pts = conf_raw * 6   # -18..+18
-    label = {3:"All TFs BREAKOUT", 2:"2 TFs BREAKOUT", 1:"1 TF BREAKOUT",
-             0:"Mixed/Neutral", -1:"1 TF BREAKDOWN", -2:"2 TFs BREAKDOWN",
-             -3:"All TFs BREAKDOWN"}.get(conf_raw, "Mixed")
+    # Count BOTH sides. Keying the label on the net score used to read
+    # "1 TF BREAKOUT" when two swing TFs had broken out and one had broken
+    # DOWN (net +1) — hiding the conflict behind a single number.
+    if bo_n and not bd_n:
+        label = ("All %d TFs BREAKOUT" % bo_n) if bo_n == len(tfs_all) \
+                else ("%d/%d TFs BREAKOUT" % (bo_n, len(tfs_all)))
+    elif bd_n and not bo_n:
+        label = ("All %d TFs BREAKDOWN" % bd_n) if bd_n == len(tfs_all) \
+                else ("%d/%d TFs BREAKDOWN" % (bd_n, len(tfs_all)))
+    elif bo_n or bd_n:
+        label = "Mixed: %d BREAKOUT / %d BREAKDOWN" % (bo_n, bd_n)
+    else:
+        label = "No swing TF signal"
     raw += pts; facts.append(("Confluence: " + label, pts))
 
     # ── 2b. Intraday TF direction adjustment ─────────────────
