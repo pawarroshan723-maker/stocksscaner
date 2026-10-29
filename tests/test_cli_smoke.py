@@ -276,3 +276,28 @@ def test_scan_tf_headers_pluralise_singular_units(mod, scanned):
     assert "(1 hour, 90d lookback)" in log
     assert "(1 day, 2500d lookback)" in log
     assert "(5 minutes, 30d lookback)" in log   # plural unchanged
+
+
+def test_individual_scan_reports_save_failure(mod, monkeypatch, capsys):
+    """'✓ Done. Saved to <db>' was printed unconditionally — a scan whose
+    every write died with 'no such table: scan_data' still claimed it had
+    persisted.  The success line must be gated on save_data()."""
+    api = FakeUpstox(daily=make_daily_series(n=400, seed=5))
+    api.intraday = {("days", "1"): make_daily_series(n=2, seed=5).tail(1)}
+    monkeypatch.setattr(mod, "requests", api)
+    syms = list(mod.SYMBOL_MAP.keys())[:3]
+    monkeypatch.setattr(mod, "SYMBOL_MAP", {k: mod.SYMBOL_MAP[k] for k in syms})
+    sym_name = next(iter(mod.SYMBOL_MAP.values()))
+
+    answers = iter([sym_name, "DAY", "n"])   # symbol, TF override, no detail
+    monkeypatch.setattr(mod, "input",
+                        lambda prompt="": next(answers, ""), raising=False)
+    monkeypatch.setattr(mod, "save_data", lambda data: False)
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        mod.scan_single_symbol({}, ["DAY"])
+    text = out.getvalue()
+    assert "SAVE FAILED" in text, "failed save not reported:\n" + text
+    assert "✓ Done. Saved" not in text, \
+        "success announced despite save_data() returning False:\n" + text

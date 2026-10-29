@@ -669,3 +669,57 @@ def test_resampled_tfs_never_flagged(mod, monkeypatch):
     data["ALPHA"]["MONTH"] = _stale_entry(mod, 400.0, "Mo 2026-10")
     assert mod._stale_intraday_warnings(
         "ALPHA", data, ["DAY", "5MIN", "WEEK", "MONTH"]) == []
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DB layer: schema memo, truthful save reporting, cache fallback
+#  (live log: every op failed "no such table" because _SCHEMAS_READY
+#   still listed the path after the file behind it lost its tables,
+#   yet the scan announced "✓ Done. Saved to master_scanner.db")
+# ═══════════════════════════════════════════════════════════════
+
+def test_schema_self_heals_when_db_file_replaced(mod, tmp_path, monkeypatch):
+    """The memo records 'DDL once ran for this PATH', but the FILE behind
+    the path can be deleted/recreated empty while the process runs —
+    afterwards every query died with 'no such table' for the process's
+    whole lifetime."""
+    db = tmp_path / "replaced.db"
+    monkeypatch.setattr(mod, "DB_FILE", str(db))
+    con = mod._db_connect()
+    con.close()
+    assert str(db) in mod._SCHEMAS_READY
+    # the file behind the path vanishes (deleted / replaced by a restore)
+    db.unlink()
+    con = mod._db_connect()          # must detect and rebuild the schema
+    try:
+        row = con.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='scan_data'").fetchone()
+    finally:
+        con.close()
+    assert row, "schema not rebuilt after the DB file was replaced"
+
+
+def test_save_data_reports_success_and_failure(mod, tmp_path, monkeypatch):
+    sample = {"X": {"symbol": "X", "DAY": {"signal": "NONE"}}}
+    # isolated_db points DB_FILE at a real file → True
+    assert mod.save_data(sample) is True
+    # a directory as DB_FILE cannot be opened → False (not swallowed)
+    monkeypatch.setattr(mod, "DB_FILE", str(tmp_path))
+    assert mod.save_data(sample) is False
+
+
+def test_cache_reload_failure_keeps_fresh_download(mod, monkeypatch):
+    """After downloading the missing range, the code reloaded the cache to
+    rebuild the frame; when that reload came back empty the ENTIRE fresh
+    download was discarded (observed live: 2500d downloaded, then '1 WEEK
+    candle' resampled from the lone live bar)."""
+    import pandas as pd
+    from tests.fake_upstox import FakeUpstox, make_daily_series
+    fake = FakeUpstox(daily=make_daily_series(n=40, seed=11))
+    monkeypatch.setattr(mod, "requests", fake, raising=False)
+    # simulate a broken cache table: every reload comes back empty
+    monkeypatch.setattr(mod, "_cache_load", lambda *a, **k: pd.DataFrame())
+    df = mod.fetch_historical_cached("NSE_EQ|INE002A01018", "days", "1",
+                                     30, {}, verbose=False)
+    assert not df.empty, "fresh download was thrown away when reload failed"

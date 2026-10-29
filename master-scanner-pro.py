@@ -885,6 +885,17 @@ CACHE_TF_MAP = {
 }
 
 
+def _merge_candles(*dfs):
+    """Concatenate candle frames, deduping on ts and sorting oldest-first."""
+    parts = [d for d in dfs if d is not None and not d.empty]
+    if not parts:
+        return pd.DataFrame()
+    if len(parts) == 1:
+        return parts[0].reset_index(drop=True)
+    return (pd.concat(parts, ignore_index=True)
+            .drop_duplicates("ts").sort_values("ts").reset_index(drop=True))
+
+
 def _cache_load(instrument_key, cache_tf):
     """
     Load all cached OHLCV candles for (instrument_key, cache_tf).
@@ -1174,7 +1185,12 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
                                                   headers, verbose)
                     if not new_df.empty:
                         _cache_save(instrument_key, cache_tf, new_df)
-                        cached_df = _cache_load(instrument_key, cache_tf)
+                        reloaded = _cache_load(instrument_key, cache_tf)
+                        # If the reload comes back empty (DB write/read broke
+                        # mid-scan), keep the repair we just downloaded instead
+                        # of discarding it and reporting no data at all.
+                        cached_df = (reloaded if not reloaded.empty
+                                     else _merge_candles(cached_df, new_df))
             elif verbose:
                 print("    " + C.DIM + "CACHE GAP [" + cache_tf + "] "
                       "still incomplete — one repair attempt per run" + C.RESET)
@@ -1209,7 +1225,16 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
             if not new_df.empty:
                 _cache_save(instrument_key, cache_tf, new_df)
                 # Reload so we have the full merged dataset from DB
-                cached_df = _cache_load(instrument_key, cache_tf)
+                reloaded = _cache_load(instrument_key, cache_tf)
+                if not reloaded.empty:
+                    cached_df = reloaded
+                else:
+                    # Reload failed after a successful download — using it
+                    # would throw away everything we just fetched (observed
+                    # live: full 2500d DAY history downloaded, then "1 WEEK
+                    # candle" resampled from the lone live bar).  Fall back
+                    # to old-in-memory ∪ fresh-download.
+                    cached_df = _merge_candles(cached_df, new_df)
         else:
             if verbose:
                 print("    " + C.DIM + "CACHE [" + cache_tf
@@ -2909,6 +2934,9 @@ def trend_strength(components):
 _SCHEMAS_READY = set()   # DB_FILEs whose DDL has already been applied
 
 
+_SCHEMA_WARNED = set()   # DB_FILEs that already got the loud DDL banner
+
+
 def _db_connect():
     """Return a connection to the SQLite database, creating tables if needed.
 
@@ -2918,7 +2946,41 @@ def _db_connect():
     con = sqlite3.connect(DB_FILE)
     con.execute("PRAGMA journal_mode=WAL")
     if DB_FILE in _SCHEMAS_READY:
-        return con
+        # The file behind this path can change WHILE we run: deleted and
+        # recreated empty, replaced by a backup restore, truncated by a
+        # crash.  The memo only records that DDL once succeeded for the
+        # path — verify the schema is actually still there, or every later
+        # query dies with "no such table" for the rest of the process's
+        # life while the memo keeps saying "ready".
+        if con.execute("SELECT 1 FROM sqlite_master "
+                       "WHERE type='table' AND name='scan_data'").fetchone():
+            return con
+        _SCHEMAS_READY.discard(DB_FILE)   # vanished → rebuild below
+    try:
+        _apply_schema(con)
+    except Exception as ex:
+        # One loud root-cause banner instead of a silent lifetime of
+        # per-operation "no such table" errors; the per-op errors still
+        # follow, but now the user is told WHY and what to do.
+        if DB_FILE not in _SCHEMA_WARNED:
+            _SCHEMA_WARNED.add(DB_FILE)
+            cprint("\n  ✖ DB SCHEMA ERROR: cannot create tables in "
+                   + DB_FILE + " (" + str(ex) + ")", C.RED, bold=True)
+            cprint("     The file is unreadable or corrupt — restore it from a "
+                   "backup or delete it, then restart.", C.RED)
+            cprint("     Scans will NOT be saved until this is fixed.", C.RED)
+        try:
+            con.close()
+        except Exception:
+            pass
+        raise
+    _SCHEMAS_READY.add(DB_FILE)
+    return con
+
+
+def _apply_schema(con):
+    """Idempotent DDL for one connection — run when a path's schema is new
+    or has vanished (file replaced under a running process)."""
     con.execute("""
         CREATE TABLE IF NOT EXISTS scan_data (
             symbol  TEXT NOT NULL,
@@ -2973,8 +3035,6 @@ def _db_connect():
             PRIMARY KEY (instrument_key, tf)
         )""")
     con.commit()
-    _SCHEMAS_READY.add(DB_FILE)
-    return con
 
 
 _corrupt = [0]      # rows that failed to decode during the last load_data()
@@ -3007,7 +3067,13 @@ def load_data():
 
 
 def save_data(data):
-    """Upsert all (symbol, tf) entries from data dict into scan_data table."""
+    """Upsert all (symbol, tf) entries from data dict into scan_data table.
+
+    Returns True on success, False if the write failed.  Callers that print
+    a success message MUST check the result: swallowing the failure here
+    while announcing "✓ Done. Saved" unconditionally made a scan whose
+    writes all died with "no such table: scan_data" claim it had persisted.
+    """
     try:
         con = _db_connect()
         rows = []
@@ -3020,8 +3086,10 @@ def save_data(data):
             rows)
         con.commit()
         con.close()
+        return True
     except Exception as ex:
         cprint("  DB save_data error: " + str(ex), C.RED)
+        return False
 
 
 def load_history(limit_per_key=None):
@@ -3736,17 +3804,24 @@ def auto_scan(data, selected_tfs=None):
         # continuing only burns the rate budget and buries the real cause.
         cprint("\n  ✗ SCAN ABORTED: " + str(exc), C.RED, bold=True)
         cprint("  No further symbols were scanned.", C.RED)
-        save_data(data)
+        if not save_data(data):
+            cprint("  ✗ Partial save FAILED — nothing was written to "
+                   + DATA_FILE, C.RED, bold=True)
         input("  Press ENTER to continue...")
         return data
     except KeyboardInterrupt:
         cprint("\n  Scan interrupted — saving what we have…", C.YELLOW)
-        save_data(data)
+        if not save_data(data):
+            cprint("  ✗ Partial save FAILED — nothing was written to "
+                   + DATA_FILE, C.RED, bold=True)
         input("  Press ENTER to continue...")
         return data
 
-    save_data(data)
-    cprint("  ✓ Scan complete. Saved to " + DATA_FILE, C.GREEN)
+    if save_data(data):
+        cprint("  ✓ Scan complete. Saved to " + DATA_FILE, C.GREEN)
+    else:
+        cprint("  ✗ SAVE FAILED — results were NOT written to " + DATA_FILE,
+               C.RED, bold=True)
     input("  Press ENTER to continue...")
     return data
 
@@ -3816,8 +3891,11 @@ def scan_single_symbol(data, selected_tfs=None):
         input("  Press ENTER to continue...")
         return data
 
-    save_data(data)
-    cprint("  ✓ Done. Saved to " + DATA_FILE, C.GREEN)
+    if save_data(data):
+        cprint("  ✓ Done. Saved to " + DATA_FILE, C.GREEN)
+    else:
+        cprint("  ✗ SAVE FAILED — results were NOT written to " + DATA_FILE,
+               C.RED, bold=True)
 
     # ── Auto-show full detail immediately ─────────────────────
     see = input("\n  Show full detail for " + sym + "? [Y/n]: ").strip().upper()
@@ -6089,8 +6167,10 @@ def edit_note(sym, data):
         for tf in list(TF_CONFIG.keys()):
             if isinstance(as_dict(data.get(sym)).get(tf), dict):
                 data[sym][tf]["note"] = n
-        save_data(data)
-        cprint("  ✓ Note saved.", C.GREEN)
+        if save_data(data):
+            cprint("  ✓ Note saved.", C.GREEN)
+        else:
+            cprint("  ✗ SAVE FAILED — the note was NOT persisted.", C.RED)
     else:
         cprint("  Note unchanged.", C.DIM)
     input("  Press ENTER...")
@@ -6929,12 +7009,16 @@ def auto_schedule_scan(data, active_tfs):
                     # cycle — stop rather than hammering the API all day.
                     cprint("\n  ✗ AUTO-SCHEDULE STOPPED: " + str(exc),
                            C.RED, bold=True)
-                    save_data(data)
+                    if not save_data(data):
+                        cprint("  ✗ Partial save FAILED — nothing was written to "
+                               + DATA_FILE, C.RED)
                     input("Press ENTER to return to menu...")
                     return data
                 time.sleep(0.8)
 
-            save_data(data)
+            if not save_data(data):
+                cprint("  ✗ SAVE FAILED — cycle results were NOT written to "
+                       + DATA_FILE, C.RED, bold=True)
 
             # ── Cycle summary ─────────────────────────────────
             done_s = datetime.now(IST).strftime("%H:%M:%S")
