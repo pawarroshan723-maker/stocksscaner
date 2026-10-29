@@ -274,7 +274,6 @@ def test_views_survive_when_the_picked_entry_is_non_dict(mod, bad, plant):
     else:
         data = {"ALPHA": {"symbol": "ALPHA", "DAY": bad}}
     mod.toggle_watchlist("ALPHA")   # watchlist_view only reads starred symbols
-    cap = None
     for name, fn in _VIEWS_ON_SYM:
         try:
             fn(mod, data)
@@ -543,7 +542,7 @@ def test_candle_pattern_list_with_non_str_items(mod):
 # ═══════════════════════════════════════════════════════════════
 
 def test_select_db_file_survives_impossible_date_names(mod, monkeypatch, tmp_path):
-    import io, sys
+    import io
     from contextlib import redirect_stdout
     for fname in ("31-02-2026.db", "99-99-9999.db", "13-13-2026.db", "01-09-2026.db"):
         (tmp_path / fname).write_bytes(b"")
@@ -597,7 +596,8 @@ def test_export_html_escapes_custom_symbol_and_sector_names(mod, monkeypatch, tm
     assert raw_sym not in html, "custom symbol interpolated raw into report"
     assert raw_sec not in html, "custom sector interpolated raw into report"
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html   # shown, but escaped
-    # nav href and card id must use the SAME esc() text so anchors still match
+    # Nav href is URL-encoded and the card id is HTML-escaped; the decoded
+    # fragments are checked against IDs in test_custom_symbol_links_resolve_after_url_decoding.
     assert 'href="#sym-' in html and 'id="sym-' in html
 
 

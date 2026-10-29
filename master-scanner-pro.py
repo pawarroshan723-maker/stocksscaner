@@ -4393,7 +4393,7 @@ def view_detail(sym, data):
             print("  Risk:Reward   : " + rrc + str(rr) + ":1" + C.RESET)
         # Next day context
         print("  Tomorrow bias : " + gb_col + C.BOLD + gb_str + C.RESET +
-              "  (" + str(gap_score) + "% probability)")
+              "  (gap-up bias score " + str(gap_score) + "/100; not a probability)")
         if bsig == "BREAKOUT" and gap_bias == "GAP_UP":
             cprint("  ✓ ALIGNED — Breakout signal + Gap-Up bias = high conviction setup", C.GREEN, bold=True)
         elif bsig == "BREAKDOWN" and gap_bias == "GAP_DOWN":
@@ -4518,36 +4518,35 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     else:
         cautions.append("No clear signal on " + (pri_tf or "DAY") + " timeframe")
 
-    # Bug fix: the old `conf >= max(2, len(tfs) - 1)` fired on ALL-but-one
-    # agreement and still printed "ALL N active timeframes agree" — with 3 TFs
-    # a single SIDEWAYS/NONE timeframe produced a false "ALL 3" claim.  conf
-    # can only equal ±len(tfs) when every timeframe actually voted the same
-    # way (SIDEWAYS/NONE contribute 0), so claim ALL only then.  Partial
-    # alignment is already reported by the multi-TF block below.
-    if len(tfs) >= 2 and conf >= len(tfs):
-        buy_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bullish")
-    elif len(tfs) >= 2 and conf <= -len(tfs):
-        sell_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bearish")
-
     # ── MULTI-TF CONFLUENCE ───────────────────────────────────
     bo_tfs = [tf for tf in tfs
               if as_dict(sym_data.get(tf)).get("signal") == "BREAKOUT"]
     bd_tfs = [tf for tf in tfs
               if as_dict(sym_data.get(tf)).get("signal") == "BREAKDOWN"]
 
-    if len(bo_tfs) >= 2:
+    # Unanimity is one piece of evidence, not two separate reasons. For a
+    # split vote, report each qualifying side independently and always warn
+    # about opposition; an elif used to hide bearish votes whenever there
+    # were two bullish votes (and even claimed agreement "at all horizons").
+    if len(tfs) >= 2 and conf == len(tfs):
+        buy_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bullish")
+    elif len(bo_tfs) >= 2:
         buy_reasons.append(
             "Bullish signal aligns across multiple timeframes (" +
-            ", ".join(bo_tfs) + ") — trend is consistent at all horizons")
+            ", ".join(bo_tfs) + ") — alignment on the listed timeframes")
+
+    if len(tfs) >= 2 and conf == -len(tfs):
+        sell_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bearish")
     elif len(bd_tfs) >= 2:
         sell_reasons.append(
             "Bearish signal aligns across multiple timeframes (" +
-            ", ".join(bd_tfs) + ") — downtrend is confirmed at all horizons")
-    elif bo_tfs and bd_tfs:
+            ", ".join(bd_tfs) + ") — alignment on the listed timeframes")
+
+    if bo_tfs and bd_tfs:
         cautions.append(
             "Mixed signals: bullish on " + ", ".join(bo_tfs) +
             " but bearish on " + ", ".join(bd_tfs) +
-            " — conflicting timeframes reduce confidence")
+            " — direction differs across timeframes")
 
     # ── RSI ───────────────────────────────────────────────────
     if rsi >= 70:
@@ -4654,10 +4653,16 @@ def generate_stock_summary(sym, sym_data, tfs=None):
         cautions.append(
             "Volume is only " + str(round(rv, 1)) + "x average — "
             "low conviction; breakout/breakdown may be a false move")
-    elif rv >= 1.5:
+    elif rv >= 1.5 and sig == "BREAKOUT":
         buy_reasons.append(
-            "Above-average volume (" + str(round(rv, 1)) + "x) confirms "
-            "genuine interest in the current move")
+            "Above-average volume (" + str(round(rv, 1)) + "x) supports the breakout")
+    elif rv >= 1.5 and sig == "BREAKDOWN":
+        sell_reasons.append(
+            "Above-average volume (" + str(round(rv, 1)) + "x) supports the breakdown")
+    elif rv >= 1.5:
+        cautions.append(
+            "Above-average volume (" + str(round(rv, 1)) + "x) without a "
+            "directional signal — check price action")
 
     # ── CANDLESTICK PATTERNS ──────────────────────────────────
     bull_cp = [p for p in cps if p in CANDLE_BULL]
@@ -4722,11 +4727,17 @@ def generate_stock_summary(sym, sym_data, tfs=None):
 
     # ── 52-WEEK HIGH / LOW ────────────────────────────────────
     if w52:
-        ph = safe_float(w52.get("pct_from_high", 0))
-        pl = safe_float(w52.get("pct_from_low",  0))
-        h52 = w52.get("high_52w", "—")
-        l52 = w52.get("low_52w",  "—")
-        if ph >= -3:
+        # A partial/old 52W record is not evidence of a 0% distance. Only
+        # describe a level when both its numeric price and percentage exist.
+        ph = safe_float(w52.get("pct_from_high"), float("nan"))
+        pl = safe_float(w52.get("pct_from_low"), float("nan"))
+        h52 = w52.get("high_52w")
+        l52 = w52.get("low_52w")
+        h52_num = safe_float(h52, float("nan"))
+        l52_num = safe_float(l52, float("nan"))
+        has_high = math.isfinite(ph) and math.isfinite(h52_num) and h52_num > 0
+        has_low = math.isfinite(pl) and math.isfinite(l52_num) and l52_num > 0 and pl >= 0
+        if has_high and ph >= -3:
             if sig == "BREAKOUT":
                 buy_reasons.append(
                     "Price is within " + str(abs(ph)) + "% of its 52-week high (₹" +
@@ -4737,7 +4748,7 @@ def generate_stock_summary(sym, sym_data, tfs=None):
                     "Price is near its 52-week high (₹" + str(h52) +
                     ") — strong resistance zone; "
                     "sellers often appear at year-highs")
-        elif pl <= 10:
+        elif has_low and pl <= 10:
             if sig == "BREAKDOWN":
                 sell_reasons.append(
                     "Price is only " + str(abs(pl)) + "% above its 52-week low (₹" +
@@ -4748,7 +4759,7 @@ def generate_stock_summary(sym, sym_data, tfs=None):
                     "Price is near its 52-week low (₹" + str(l52) +
                     ") — deeply discounted; a reversal here would offer "
                     "an excellent risk:reward for patient buyers")
-        elif pl >= 50:
+        elif has_low and pl >= 50:
             buy_reasons.append(
                 "Price has recovered " + str(pl) + "% from its 52-week low — "
                 "strong trend recovery underway")
@@ -5622,9 +5633,10 @@ def export_html(data, tfs=None):
     def fmt_p(v):
         try:
             f = float(v)
-            if f >= 10000: return "₹{:,.0f}".format(f)
-            if f >= 1000:  return "₹{:,.1f}".format(f)
-            return "₹{:.2f}".format(f)
+            # Prices and trade levels are stored to two decimal places. Do
+            # not discard paise for expensive stocks: an entry, target or
+            # stop could otherwise render as the same price.
+            return "₹{:,.2f}".format(f) if math.isfinite(f) else "—"
         # Non-numeric junk from a corrupt row must be escaped like every other
         # interpolated string — otherwise "<script>" in a price field lands
         # raw in the report.
@@ -5647,6 +5659,11 @@ def export_html(data, tfs=None):
         return (str(v).replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace('"', "&quot;")
                 .replace("'", "&#39;"))
+
+    def symbol_fragment(sym):
+        # An HTML-escaped ID is not a URL-encoded fragment. In particular a
+        # literal "%20" in a custom name must not turn into a space on click.
+        return quote("sym-" + str(sym), safe="")
 
     # ── Pre-compute summary stats ─────────────────────────────
     bo_d = bd_d = sw_d = no_d = 0
@@ -5748,6 +5765,7 @@ a:hover{text-decoration:underline}
 /* ── GRIDS ── */
 .g2{display:grid;grid-template-columns:repeat(auto-fit,minmax(370px,1fr));gap:16px;margin-bottom:16px}
 .g3{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
+.g2 > *, .g3 > *{min-width:0}
 /* ── BADGES ── */
 .badge{display:inline-block;font-family:var(--mono);font-size:11.5px;font-weight:700;
   letter-spacing:.03em;padding:3px 9px;border-radius:5px;white-space:nowrap}
@@ -5762,6 +5780,7 @@ a:hover{text-decoration:underline}
 .tfd.bo{background:var(--grd);color:var(--gr)}.tfd.bd{background:var(--red);color:var(--re)}
 .tfd.sw{background:var(--yed);color:var(--ye)}.tfd.none{background:var(--s2);color:var(--mu)}
 /* ── TABLES ── */
+.table-scroll{overflow-x:auto;max-width:100%}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th{font-family:var(--mono);font-size:12px;letter-spacing:.05em;text-transform:uppercase;
   color:#8f99b5;text-align:left;padding:9px 12px;border-bottom:2px solid var(--bd);
@@ -5805,8 +5824,8 @@ tr:last-child td{border-bottom:none}
 /* ── TF BLOCKS ── */
 .tf-block{border:1px solid var(--bd);border-radius:8px;margin-bottom:10px;overflow:hidden}
 .tf-block-hdr{padding:10px 14px;background:var(--s2);display:flex;align-items:center;gap:12px;
-  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:14px;font-weight:700}
-.tf-block-body{padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+  flex-wrap:wrap;border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:14px;font-weight:700}
+.tf-block-body{padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:12px}
 .tf-kv{font-size:13.5px}
 .tf-kv-lbl{color:var(--mu);font-size:11.5px;margin-bottom:2px;
   text-transform:uppercase;letter-spacing:.05em;font-weight:600}
@@ -5825,6 +5844,7 @@ tr:last-child td{border-bottom:none}
 .gap-bar-wrap{background:rgba(255,255,255,.07);border-radius:5px;height:10px;overflow:hidden;flex:1}
 .gap-bar-fill{height:10px;border-radius:5px}
 .gap-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.gap-context{font-size:12.5px;color:var(--mu);margin-bottom:10px}
 .gap-score{font-family:var(--mono);font-size:30px;font-weight:700;min-width:62px;line-height:1}
 .gap-bias{font-family:var(--mono);font-size:16px;font-weight:700}
 .gap-facts{margin-top:8px}
@@ -5859,8 +5879,8 @@ tr:last-child td{border-bottom:none}
 .ftr{border-top:1px solid var(--bd);padding:14px 26px;font-family:var(--mono);
   font-size:12px;color:var(--mu);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
 /* ── RESPONSIVE ── */
-@media(max-width:1560px){.nav{display:none}}
-@media(max-width:1000px){.g2,.g3{grid-template-columns:1fr}.wrap{padding:16px 14px 8px}
+@media(max-width:1760px){.nav{display:none}}
+@media(max-width:1000px){.g2,.g3{grid-template-columns:minmax(0,1fr)}.wrap{padding:16px 14px 8px}
   .hdr{padding:12px 14px}.ftr{padding:12px 14px}}
 @media(max-width:640px){.cards{grid-template-columns:1fr}.card-val{font-size:30px}
   .det-sym{font-size:18px}.gap-score{font-size:26px}}
@@ -5884,7 +5904,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="nav"><div class="nav-title">Symbols</div>')
     for sym, e in ranked:
         sig = as_dict(e.get("DAY")).get("signal", "NONE")
-        w('<a href="#sym-' + esc(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
+        w('<a href="#' + symbol_fragment(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
     w('</div>')
 
     w('<div class="wrap">')
@@ -5940,7 +5960,7 @@ tr:last-child td{border-bottom:none}
         rsi_cls = "rsi-ob" if rsi>70 else ("rsi-bull" if rsi>55 else ("rsi-mid" if rsi>40 else "rsi-os"))
         rr_col = "var(--gr)" if rr>=1 else ("var(--ye)" if rr>=0.5 else "var(--re)")
         chips = "".join('<span class="chip">' + esc(p) + '</span>' for p in cps) if cps else '<span class="mu">—</span>'
-        w('<tr><td><a href="#sym-' + esc(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
+        w('<tr><td><a href="#' + symbol_fragment(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
         w('<td><div class="sbar-num" style="color:' + sc_col + '">' + str(cs) + '</div><div class="sbar-wrap"><div class="sbar-bg"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></div></td>')
         w('<td class="mono">' + fmt_p(de.get("price",0)) + '</td>')
         w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
@@ -5954,8 +5974,8 @@ tr:last-child td{border-bottom:none}
     # ── DASHBOARD TABLE ──────────────────────────────────────
     w('<div class="sec"><div class="sec-title">All Symbols — DAY Timeframe <span>Sorted by Composite Score</span></div>')
     w('<div style="overflow-x:auto"><table><thead><tr>')
-    for h in ["Symbol","Signal"] + [tf[:4] for tf in tfs] + ["Score","Price","RSI","RVol","R:R","EMA","Candle"]:
-        w('<th>' + h + '</th>')
+    for h in ["Symbol","Signal"] + list(tfs) + ["Score","Price","RSI","RVol","R:R","EMA","Candle"]:
+        w('<th>' + esc(h) + '</th>')
     w('</tr></thead><tbody>')
     for sym, e in ranked:
         de  = as_dict(e.get("DAY"))
@@ -5972,7 +5992,7 @@ tr:last-child td{border-bottom:none}
         rv_col = "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")
         ema_col = "var(--gr)" if "FULL BULL" in ema else ("var(--re)" if "FULL BEAR" in ema else ("var(--gr)" if "BULL" in ema else ("var(--re)" if "BEAR" in ema else "var(--mu)")))
         chips = "".join('<span class="chip">' + esc(p) + '</span>' for p in cps)
-        w('<tr><td><a href="#sym-' + esc(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
+        w('<tr><td><a href="#' + symbol_fragment(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
         w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(str(sig),"--") + '</span></td>')
         for tf in tfs:
             s2 = as_dict(e.get(tf)).get("signal","NONE")
@@ -6015,7 +6035,7 @@ tr:last-child td{border-bottom:none}
 
         # Signal snapshot strip
         tf_order = [tf for tf in list(TF_CONFIG.keys()) if tf in e]
-        w('<div style="margin-bottom:14px">')
+        w('<div class="table-scroll" role="region" aria-label="Signal snapshot for ' + esc(sym) + '" tabindex="0" style="margin-bottom:14px">')
         w('<table style="width:100%"><thead><tr>')
         for h in ["TF","Signal","Score","RSI","RVol","Price","Date"]:
             w('<th>' + h + '</th>')
@@ -6087,13 +6107,13 @@ tr:last-child td{border-bottom:none}
                 ("ATR", "₹"+str(round(atr,2))+" ("+str(atrp)+"%)", "var(--tx)"),
                 ("RSI(14)", str(rsi), "var(--gr)" if rsi>65 else ("var(--re)" if rsi<35 else "var(--ye)")),
                 ("Rel Vol", str(rv)+"×", "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")),
-                ("EMA Align", esc(ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR")), ema_col),
+                ("EMA Align", ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR"), ema_col),
                 ("SuperTrend", st_txt, st_col),
                 ("MACD Cross", mc if mc else "—", mc_col),
                 ("Trend Str", str(int(ts)), ts_col),
                 ("Comp Score", str(cs)+"/100", sc_col),
             ]:
-                w('<div class="tf-kv"><div class="tf-kv-lbl">' + lbl + '</div><div class="tf-kv-val" style="color:' + col + '">' + str(val) + '</div></div>')
+                w('<div class="tf-kv"><div class="tf-kv-lbl">' + lbl + '</div><div class="tf-kv-val" style="color:' + col + '">' + esc(val) + '</div></div>')
             w('</div>')
 
             # S/R + targets
@@ -6153,11 +6173,12 @@ tr:last-child td{border-bottom:none}
         # Next-day gap prediction
         gap_score, gap_bias, gap_facts = calc_next_day_gap_score(e)
         gb_col = "var(--gr)" if gap_bias=="GAP_UP" else ("var(--re)" if gap_bias=="GAP_DOWN" else "var(--ye)")
-        gb_str = ("▲ GAP UP LIKELY" if gap_bias=="GAP_UP" else ("▼ GAP DOWN LIKELY" if gap_bias=="GAP_DOWN" else "— NEUTRAL / WAIT"))
+        gb_str = ("▲ GAP-UP BIAS" if gap_bias=="GAP_UP" else ("▼ GAP-DOWN BIAS" if gap_bias=="GAP_DOWN" else "— NEUTRAL / WAIT"))
         bar_pct = gap_score
         bar_col = "var(--gr)" if gap_score>=62 else ("var(--re)" if gap_score<=38 else "var(--ye)")
 
         w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
+        w('<div class="gap-context">Gap-up bias score (0–100%), not a calibrated probability; lower scores indicate gap-down bias.</div>')
         w('<div class="gap-row">')
         w('<div class="gap-score" style="color:' + gb_col + '">' + str(gap_score) + '%</div>')
         w('<div class="gap-bar-wrap"><div class="gap-bar-fill" style="width:' + str(bar_pct) + '%;background:' + bar_col + '"></div></div>')
@@ -6289,8 +6310,9 @@ def edit_note(sym, data):
 
 def calc_next_day_gap_score(sym_data):
     """
-    Score a symbol 0-100 for next-day gap-up probability using
-    end-of-day signals from the last DAY candle.
+    Compute a 0-100 heuristic gap-up bias score from end-of-day signals.
+    Higher scores suggest an upward bias and lower scores a downward bias;
+    the score is not a calibrated probability.
 
     Factors (positive = gap-up bias, negative = gap-down bias):
       Close position in day range    ±20  (top/bottom 20% of H-L)
@@ -6336,11 +6358,14 @@ def calc_next_day_gap_score(sym_data):
         elif pos >= 0.2: pts =  -8; label = "Close in lower range"
         else:            pts = -20; label = "Close near Low (bottom 20%)"
     else:
-        if   ts >= 70:  pts = 20;  label = "Close near High (strong)"
-        elif ts >= 40:  pts = 10;  label = "Close in upper range"
-        elif ts >= 0:   pts =  3;  label = "Close mid-range"
-        elif ts >= -40: pts = -8;  label = "Close in lower range"
-        else:           pts = -20; label = "Close near Low (weak)"
+        if   ts >= 70:  pts = 20
+        elif ts >= 40:  pts = 10
+        elif ts >= 0:   pts =  3
+        elif ts >= -40: pts = -8
+        else:           pts = -20
+        # Legacy rows can lack OHLC. Preserve the existing proxy weight, but
+        # do not present trend strength as a measured close position.
+        label = "Trend strength proxy (day range unavailable; trend=" + str(ts) + ")"
     raw += pts; facts.append((label, pts))
 
     # ── 2. Multi-TF signal confluence ────────────────────────
@@ -6440,13 +6465,24 @@ def calc_next_day_gap_score(sym_data):
     raw += pts; facts.append(("EMA: " + label, pts))
 
     # ── 7. 52W High proximity ─────────────────────────────────
-    w52     = as_dict(e.get("52w"))
-    pct_h   = safe_float(w52.get("pct_from_high", -50))
-    if   pct_h >= -1:  pts = 8; label = "At 52W High! (+" + str(abs(pct_h)) + "%)"
+    w52 = as_dict(e.get("52w"))
+    pct_h = safe_float(w52.get("pct_from_high"), float("nan"))
+    if not math.isfinite(pct_h):
+        # Missing/invalid data is not evidence that price is 50% below its
+        # high. Do not manufacture a bearish factor from a default value.
+        pts = 0; label = "Unavailable"
+    elif pct_h >= -1:
+        pts = 8
+        if pct_h < 0:
+            label = "Near 52W High (" + str(pct_h) + "%)"
+        elif pct_h == 0:
+            label = "At 52W High (0.0%)"
+        else:
+            label = "Above 52W High (+" + str(pct_h) + "%)"
     elif pct_h >= -3:  pts = 6; label = "Near 52W High (" + str(pct_h) + "%)"
     elif pct_h >= -8:  pts = 3; label = "Within 8% of 52W High"
     elif pct_h <= -30: pts =-3; label = "Far from 52W High (" + str(pct_h) + "%)"
-    else:               pts = 0; label = "52W High dist: " + str(pct_h) + "%"
+    else:              pts = 0; label = "52W High dist: " + str(pct_h) + "%"
     raw += pts; facts.append(("52W High: " + label, pts))
 
     # ── 8. Trend strength ─────────────────────────────────────
@@ -6473,7 +6509,8 @@ def calc_next_day_gap_score(sym_data):
 
 def next_day_gap_view(data):
     """
-    Rank all symbols by next-day gap probability using end-of-day signals.
+    Rank symbols by the heuristic gap-up bias score using end-of-day signals.
+    The score is not a calibrated probability.
     Run this AFTER market close (3:30 PM IST) for best results.
     No extra API calls needed — uses cached scan data.
     """
@@ -6512,7 +6549,7 @@ def next_day_gap_view(data):
            _ljust("SYMBOL",  12) + "  " +
            _rjust("SCORE",    6) + "  " +
            _ljust("BIAS",    10) + "  " +
-           _ljust("PROB BAR", 20) + "  " +
+           _ljust("BIAS BAR", 20) + "  " +
            _rjust("PRICE",    9) + "  " +
            _rjust("RSI",      5) + "  " +
            _rjust("RVol",     5) + "  " +
@@ -6529,7 +6566,7 @@ def next_day_gap_view(data):
         elif bias == "GAP_DOWN": bias_col = C.RED;    bias_str = "▼ GAP_DOWN"
         else:                    bias_col = C.YELLOW;  bias_str = "— NEUTRAL "
 
-        # Probability bar: green for gap-up zone, red for gap-down zone
+        # Directional bias bar: green for gap-up zone, red for gap-down zone
         bar_len  = 20
         filled   = int(safe_float(score) / 100 * bar_len)
         if   score >= 62: bar_col = C.GREEN
@@ -6602,7 +6639,7 @@ def next_day_gap_view(data):
             cprint("    • Mixed signals — wait for first 15MIN candle direction before entering", C.DIM)
         print()
 
-    cprint("  NOTE: This is a probability estimate, NOT a guarantee.", C.YELLOW)
+    cprint("  NOTE: This is a heuristic gap-up bias score, not a calibrated probability.", C.YELLOW)
     cprint("  Always confirm with live price action at open (9:15 IST).", C.DIM)
     print()
     input("  Press ENTER...")
