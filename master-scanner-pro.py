@@ -42,6 +42,7 @@ import sys
 import time
 import math
 import sqlite3
+import textwrap
 from datetime import datetime, timedelta, date
 from urllib.parse import quote
 import pytz
@@ -1408,6 +1409,15 @@ def safe_float(val, default=0.0):
         return default if math.isnan(v) else v
     except Exception:
         return default
+
+
+def _valid_reference_price(value):
+    """A usable quoted price must be finite and strictly positive."""
+    if isinstance(value, bool):
+        return False
+    price = safe_float(value, float("nan"))
+    return math.isfinite(price) and price > 0
+
 
 def calc_rsi(series, period=14):
     """
@@ -2863,6 +2873,103 @@ def get_price_targets(df, signal, tf="DAY"):
     return {}
 
 
+# These are snapshot-based *conditions*, not orders or prices at which a
+# trade is known to have executed. Keep the warning the same in every view.
+ENTRY_CONDITION_NOTE = (
+    "Entry checks use price only, with no extra volume filter. "
+    "Snapshot only — not monitored live. "
+    "Check a full candle starting after "
+    "the scan time on your chart; it may already have occurred. A later scan "
+    "recalculates levels instead of tracking these thresholds. Pullback here "
+    "means a same-candle support touch and reclaim or resistance touch and "
+    "rejection, not proof of an earlier breakout. A trigger is not a fill: an "
+    "actual fill may differ or not occur. Recheck the signal and recalculate "
+    "targets, stop and R:R using the actual fill."
+)
+
+
+def get_conditional_entries(entry, tf):
+    """Describe two possible price-action conditions from a scan snapshot.
+
+    For a bullish signal use the nearest resistance for a close-above
+    breakout, or the nearest support for a same-candle touch-and-bounce.
+    For a bearish signal use the nearest support for a close-below breakdown,
+    or the nearest resistance for a same-candle touch-and-rejection. Levels
+    must be on the correct side of the stored reference close. A missing or
+    invalid level is unavailable, never manufactured from ATR or a target.
+
+    The rules concern a complete candle starting after the scan time; this
+    function does not check historical bars, monitor the market, predict the
+    confirmation time, calculate a fill, or assign targets to the conditions.
+    """
+    entry = as_dict(entry)
+    signal = str(entry.get("signal") or "")
+    direction = {"BREAKOUT": "BULLISH", "BREAKDOWN": "BEARISH"}.get(signal)
+    breakout_label = ("Breakout (bullish)" if direction == "BULLISH" else
+                      "Breakdown (bearish)" if direction == "BEARISH" else
+                      "Breakout / breakdown")
+    pullback_label = ("Pullback / retest (bullish)" if direction == "BULLISH" else
+                      "Pullback / retest (bearish)" if direction == "BEARISH" else
+                      "Pullback / retest")
+
+    def unavailable(message):
+        return {"direction": direction,
+                "breakout": {"label": breakout_label, "level": None, "when": message},
+                "pullback": {"label": pullback_label, "level": None, "when": message}}
+
+    if not direction:
+        return unavailable("Unavailable: no directional breakout/breakdown signal.")
+
+    def price_value(value):
+        if not _valid_reference_price(value):
+            return None
+        value = round(safe_float(value), 2)  # stored/displayed S/R uses paise
+        return value if value > 0 else None
+
+    price = price_value(entry.get("price"))
+    if price is None:
+        return unavailable("Unavailable: no valid reference price; rescan this timeframe.")
+    updated = entry.get("updated")
+    try:
+        if not isinstance(updated, str):
+            raise ValueError("missing scan time")
+        datetime.strptime(updated.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return unavailable("Unavailable: scan time is missing or invalid; rescan this timeframe.")
+
+    supports = [p for p in map(price_value, as_list(entry.get("support")))
+                if p is not None and p < price]
+    resistances = [p for p in map(price_value, as_list(entry.get("resistance")))
+                   if p is not None and p > price]
+    support = max(supports) if supports else None
+    resistance = min(resistances) if resistances else None
+    no_support = "Unavailable: No support below the reference price in this scan."
+    no_resistance = "Unavailable: No resistance above the reference price in this scan."
+    candle = "A completed " + str(tf) + " candle "
+
+    def rupees(level):
+        return "₹{:,.2f}".format(level)
+
+    if direction == "BULLISH":
+        breakout_level, pullback_level = resistance, support
+        breakout_when = (candle + "closes above " + rupees(resistance) + "."
+                         if resistance is not None else no_resistance)
+        pullback_when = (candle + "trades at or below " + rupees(support) +
+                         " and closes above " + rupees(support) + "."
+                         if support is not None else no_support)
+    else:
+        breakout_level, pullback_level = support, resistance
+        breakout_when = (candle + "closes below " + rupees(support) + "."
+                         if support is not None else no_support)
+        pullback_when = (candle + "trades at or above " + rupees(resistance) +
+                         " and closes below " + rupees(resistance) + "."
+                         if resistance is not None else no_resistance)
+
+    return {"direction": direction,
+            "breakout": {"label": breakout_label, "level": breakout_level, "when": breakout_when},
+            "pullback": {"label": pullback_label, "level": pullback_level, "when": pullback_when}}
+
+
 def _floor_price(level, close):
     """Keep a computed price level strictly positive.
 
@@ -3932,9 +4039,11 @@ def _score_tf_key(entry, tfs):
     Priority: DAY → WEEK → MONTH → 1HR → 15MIN → 5MIN → first dict-valued
     key in tfs → first key in tfs.
     """
+    entry = as_dict(entry)
     preferred = ["DAY", "WEEK", "MONTH", "1HR", "15MIN", "5MIN"]
     for tf in preferred:
-        if tf in entry and safe_float(as_dict(entry[tf]).get("price", 0)):
+        raw_price = as_dict(entry.get(tf)).get("price", 0)
+        if _valid_reference_price(raw_price):
             return tf
     # Fallback: first tf in tfs that exists in entry AND holds a dict
     for tf in tfs:
@@ -4183,11 +4292,13 @@ def view_detail(sym, data):
         e   = as_dict(sym_data[tf])
         sig = e.get("signal", "NONE")
         col = signal_color(sig)
+        ref_ok = _valid_reference_price(e.get("price"))
 
         print(col + C.BOLD + "  ┌── " + tf + " " + "─" * (W - 8 - len(tf)) + C.RESET)
         print("  │  Signal      : " + col + C.BOLD + SIGNAL_LABEL.get(str(sig), "—") + C.RESET +
               C.DIM + "  [" + str(e.get("reason") or "—") + "]" + C.RESET)
-        print("  │  Price/ATR   : ₹" + str(e.get("price","—")) +
+        ref_text = "₹" + str(e.get("price")) if ref_ok else "—"
+        print("  │  Price/ATR   : " + ref_text +
               "  ATR: ₹" + str(e.get("atr","—")) +
               "  ATR%: " + str(e.get("atr_pct",0)) + "%")
         print("  │  Volume      : [" + bar(e.get("volume",0), color=C.BLUE) + "] " +
@@ -4234,15 +4345,18 @@ def view_detail(sym, data):
         rr = safe_float(e.get("risk_reward", 0))
         sc_col = C.GREEN if cs >= 65 else (C.YELLOW if cs >= 40 else C.DIM)
         rr_col = C.GREEN if rr >= 2  else (C.YELLOW if rr >= 1.5 else C.RED)
+        rr_text = str(rr) + ":1" if ref_ok and math.isfinite(rr) else "—"
         print("  │  Comp.Score  : " + sc_col + str(cs) + "/100" + C.RESET +
-              "  R:R: " + rr_col + str(rr) + ":1" + C.RESET)
+              "  Ref R:R: " + rr_col + rr_text + C.RESET)
 
         tgt = as_dict(e.get("targets"))
-        if tgt:
-            print("  │  Targets     : " + C.GREEN +
+        if tgt and ref_ok:
+            print("  │  Ref levels  : " + C.GREEN +
                   "T1=₹" + str(tgt.get("target1","—")) +
                   "  T2=₹" + str(tgt.get("target2","—")) + C.RESET +
                   "  " + C.RED + "SL=₹" + str(tgt.get("stop","—")) + C.RESET)
+        elif tgt:
+            print("  │  Ref levels  : unavailable without a valid reference price")
 
         supp = as_list(e.get("support"))
         res  = as_list(e.get("resistance"))
@@ -4250,6 +4364,20 @@ def view_detail(sym, data):
                        "  ".join("₹" + str(s) for s in supp) + C.RESET)
         if res:  print("  │  Resistance  : " + C.RED +
                        "  ".join("₹" + str(r) for r in res)  + C.RESET)
+
+        if (str(sig) in ("BREAKOUT", "BREAKDOWN", "SIDEWAYS") or
+                (str(sig) == "NONE" and is_scanned_entry(e))):
+            setups = get_conditional_entries(e, tf)
+            print("  │  Conditional entries — scan: " + str(e.get("updated") or "unavailable") + " IST")
+            for setup in (setups["breakout"], setups["pullback"]):
+                print("  │    " + setup["label"] + ":")
+                for line in textwrap.wrap(setup["when"], width=max(W - 9, 30)):
+                    print("  │      " + line)
+            for line in textwrap.wrap(ENTRY_CONDITION_NOTE, width=max(W - 9, 30)):
+                print("  │    " + line)
+            if tgt and ref_ok:
+                print("  │    Reference levels and R:R use the latest stored candle close,")
+                print("  │    which may be unfinished; they are not entry-specific estimates.")
 
         cps = as_list(e.get("candle_patterns"))
         if cps:
@@ -4267,10 +4395,10 @@ def view_detail(sym, data):
         if divs: print("  │  RSI Div     : " + "  ".join(divs))
 
         if e.get("retest_bo"):
-            print("  │  " + C.GREEN + C.BOLD + "★ RETEST BREAKOUT  R1=₹" +
+            print("  │  " + C.GREEN + C.BOLD + "★ RETEST BREAKOUT (scan indicator) R1=₹" +
                   str(e.get("retest_bo_level",0)) + C.RESET)
         if e.get("retest_bd"):
-            print("  │  " + C.RED + C.BOLD + "★ RETEST BREAKDOWN S1=₹" +
+            print("  │  " + C.RED + C.BOLD + "★ RETEST BREAKDOWN (scan indicator) S1=₹" +
                   str(e.get("retest_bd_level",0)) + C.RESET)
 
         fib = as_dict(e.get("fibonacci"))
@@ -4342,7 +4470,7 @@ def view_detail(sym, data):
         print()
 
     # ══ 6. TRADE PLAN ════════════════════════════════════════════
-    cprint("  TRADE PLAN RECOMMENDATION", C.WHITE, bold=True)
+    cprint("  REFERENCE TRADE PLAN (not an executed entry)", C.WHITE, bold=True)
     div("─")
     # Verdict FIRST: the recommended setup must agree with the STOCK SUMMARY
     # printed immediately below. This used to pick the single highest
@@ -4383,14 +4511,18 @@ def view_detail(sym, data):
             cprint("  \u26a0 CONFLICT \u2014 no " + str(prefer) + " setup exists; this "
                    "opposite-side setup is NOT what the VERDICT below calls for.",
                    C.YELLOW)
-        if btgt:
-            print("  Entry         : " + C.CYAN + "₹" + str(be.get("price","—")) + C.RESET)
+        if btgt and _valid_reference_price(be.get("price")):
+            print("  Reference price: " + C.CYAN + "₹" + str(be.get("price","—")) + C.RESET)
             print("  Target 1      : " + C.GREEN + "₹" + str(btgt.get("target1","—")) + C.RESET)
             print("  Target 2      : " + C.GREEN + "₹" + str(btgt.get("target2","—")) + C.RESET)
             print("  Stop Loss     : " + C.RED   + "₹" + str(btgt.get("stop","—"))    + C.RESET)
             rr  = safe_float(be.get("risk_reward",0))
             rrc = C.GREEN if rr >= 2 else (C.YELLOW if rr >= 1.5 else C.RED)
-            print("  Risk:Reward   : " + rrc + str(rr) + ":1" + C.RESET)
+            print("  Ref Risk:Reward: " + rrc + str(rr) + ":1" + C.RESET)
+            cprint("  Levels assume the stored close, not a confirmed entry; see "
+                   "conditional entries above.", C.DIM)
+        elif btgt:
+            cprint("  Reference levels unavailable without a valid reference price.", C.YELLOW)
         # Next day context
         print("  Tomorrow bias : " + gb_col + C.BOLD + gb_str + C.RESET +
               "  (gap-up bias score " + str(gap_score) + "/100; not a probability)")
@@ -4470,18 +4602,21 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     sell_reasons = []
     cautions     = []
 
-    # ── Pick primary TF (DAY preferred, else first available) ─
-    pri_tf  = "DAY" if "DAY" in sym_data else next(
-        (tf for tf in TF_CONFIG if tf in sym_data), None)
+    # Prefer DAY only when it has price data; empty DAY placeholders must not
+    # hide the signal from a scanned intraday or longer timeframe.
+    pri_tf  = _score_tf_key(sym_data, tfs)
     # Bug fix: sym_data[pri_tf] may be a corrupt non-dict JSON scalar —
     # as_dict guarantees the .get chain below never raises.
     e       = as_dict(sym_data.get(pri_tf)) if pri_tf else {}
-    price   = safe_float(e.get("price",  0))
+    raw_price = e.get("price", 0)
+    price   = safe_float(raw_price) if _valid_reference_price(raw_price) else 0.0
     sig     = e.get("signal",         "NONE")
     rsi     = safe_float(e.get("rsi",  50))
     rv      = safe_float(e.get("rel_vol", 1))
     cs      = safe_float(e.get("composite_score", 0))
     rr      = safe_float(e.get("risk_reward", 0))
+    if not price or not math.isfinite(rr):
+        rr = 0.0  # A reference R:R cannot be assessed without a valid close.
     # str(): a legacy row can hold a non-str here; `in ema_aln` would raise
     # TypeError: argument of type 'int' is not iterable.
     ema_aln = str(e.get("ema_alignment", "") or "")
@@ -4497,22 +4632,22 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     # ── SIGNAL ────────────────────────────────────────────────
     if sig == "BREAKOUT":
         buy_reasons.append(
-            "Price has broken out on the " + (pri_tf or "DAY") +
-            " chart — momentum is pointing upward")
+            "Scanner reports a bullish BREAKOUT signal on the " + (pri_tf or "DAY") +
+            " chart — this is not confirmation of a later entry condition")
         if e.get("retest_bo"):
             lvl = e.get("retest_bo_level", "")
             buy_reasons.append(
-                "RETEST BREAKOUT confirmed: resistance ₹" + str(lvl) +
-                " was tested twice and held as new support — very high conviction")
+                "Bullish retest indicator in this scan at ₹" + str(lvl) +
+                " — separate from the conditional entry rules")
     elif sig == "BREAKDOWN":
         sell_reasons.append(
-            "Price has broken down on the " + (pri_tf or "DAY") +
-            " chart — momentum is pointing downward")
+            "Scanner reports a bearish BREAKDOWN signal on the " + (pri_tf or "DAY") +
+            " chart — this is not confirmation of a later entry condition")
         if e.get("retest_bd"):
             lvl = e.get("retest_bd_level", "")
             sell_reasons.append(
-                "RETEST BREAKDOWN confirmed: support ₹" + str(lvl) +
-                " failed twice — sellers are in control")
+                "Bearish retest indicator in this scan at ₹" + str(lvl) +
+                " — separate from the conditional entry rules")
     elif sig == "SIDEWAYS":
         cautions.append("Price is consolidating — no directional edge yet; wait for a breakout or breakdown")
     else:
@@ -4773,24 +4908,14 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     # therefore added a spurious BUY argument to every short, inflating the
     # score and, in close cases, flipping the verdict to BUY outright.
     # The praise has to follow the direction of the trade.
-    if rr >= 2.5 and sig == "BREAKOUT":
-        buy_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — excellent setup; "
-            "you risk ₹1 to potentially make ₹" + str(rr))
-    elif rr >= 2.5 and sig == "BREAKDOWN":
-        sell_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — excellent short setup; "
-            "you risk ₹1 to potentially make ₹" + str(rr))
-    elif rr >= 1.5 and sig == "BREAKOUT":
-        buy_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — acceptable setup")
-    elif rr >= 1.5 and sig == "BREAKDOWN":
-        sell_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — acceptable short setup")
+    if rr >= 1.5 and sig in ("BREAKOUT", "BREAKDOWN"):
+        reason = ("Reference Risk:Reward is " + str(rr) + ":1 at the latest "
+                  "stored candle close — recalculate for an actual fill")
+        (buy_reasons if sig == "BREAKOUT" else sell_reasons).append(reason)
     elif 0 < rr < 1.5 and sig in ("BREAKOUT", "BREAKDOWN"):
         cautions.append(
-            "Risk:Reward is only " + str(rr) + ":1 — "
-            "the potential gain does not justify the risk at this entry")
+            "Reference Risk:Reward is only " + str(rr) + ":1 at the latest "
+            "stored candle close — an actual fill may have a different ratio")
 
     # ── COMPOSITE SCORE ───────────────────────────────────────
     #
@@ -4831,18 +4956,13 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     if tgt and price:
         sl  = safe_float(tgt.get("stop", 0))
         t1  = safe_float(tgt.get("target1", 0))
-        if sl > 0 and sig == "BREAKOUT":
-            buy_reasons.append(
-                "Entry: ₹" + str(price) +
-                "  |  Stop Loss: ₹" + str(sl) +
-                "  |  Target 1: ₹" + str(t1) +
-                " — clear trade levels defined")
-        elif sl > 0 and sig == "BREAKDOWN":
-            sell_reasons.append(
-                "Short Entry: ₹" + str(price) +
-                "  |  Stop Loss: ₹" + str(sl) +
-                "  |  Target 1: ₹" + str(t1) +
-                " — clear trade levels defined")
+        if sl > 0 and sig in ("BREAKOUT", "BREAKDOWN"):
+            reference_levels = (
+                "Reference " + (pri_tf or "DAY") + " candle close: ₹" + str(price) +
+                "  |  Reference Stop: ₹" + str(sl) +
+                "  |  Reference Target 1: ₹" + str(t1) +
+                " — estimates, not an entry trigger")
+            (buy_reasons if sig == "BREAKOUT" else sell_reasons).append(reference_levels)
 
     # ── VERDICT ───────────────────────────────────────────────
     bull_pts = len(buy_reasons)
@@ -4895,25 +5015,21 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     else:
         headline = (sym + " (" + sec + ") — no actionable setup; stay on the sidelines")
 
-    # Action sentence
+    # The stored price is only the latest candle close, not a filled entry.
+    # Verdicts are directional summaries; neither they nor the reference
+    # targets imply that a conditional setup has triggered.
     if verdict == "BUY":
-        if tgt:
-            action = ("Consider a LONG entry near ₹" + str(price) +
-                      " with stop below ₹" + str(tgt.get("stop","—")) +
-                      " and target ₹" + str(tgt.get("target1","—")) + ".")
-        else:
-            action = "Consider a LONG entry; use ATR or swing low as stop loss."
+        action = ("Bullish bias only. Review a completed-candle breakout or "
+                  "pullback condition when available; recalculate risk and targets "
+                  "using any actual fill.")
     elif verdict == "SELL":
-        if tgt:
-            action = ("Consider EXITING longs or a SHORT entry near ₹" + str(price) +
-                      " with stop above ₹" + str(tgt.get("stop","—")) +
-                      " and target ₹" + str(tgt.get("target1","—")) + ".")
-        else:
-            action = "Consider EXITING or shorting; use ATR or swing high as stop."
+        action = ("Bearish bias only. Review a completed-candle breakdown or "
+                  "retest condition when available; recalculate risk and targets "
+                  "using any actual fill.")
     elif verdict == "HOLD":
-        action = "Hold existing positions if you own it; do NOT initiate new trades."
+        action = "Wait for clearer direction and a completed-candle entry condition."
     else:
-        action = "No trade. Wait for a clear breakout or breakdown before risking capital."
+        action = "No clear setup. Wait for direction and a completed-candle entry condition."
 
     return {
         "verdict":      verdict,
@@ -5544,17 +5660,21 @@ def export_report(data, tfs=None):
             w52 = as_dict(e.get("52w"))
             div_= as_dict(e.get("rsi_divergence"))
             cps = as_list(e.get("candle_patterns"))
+            ref_ok = _valid_reference_price(e.get("price"))
+            rr_num = safe_float(e.get("risk_reward", 0), float("nan"))
+            rr_text = str(rr_num) + ":1" if ref_ok and math.isfinite(rr_num) else "—"
             lines += [
                 "  " + tf,
                 "    Signal       : " + str(e.get("signal") or "—"),
                 "    Reason       : " + str(e.get("reason") or "—"),
-                "    Price        : ₹" + str(e.get("price", "—")),
+                "    Reference price (latest candle close): " +
+                ("₹" + str(e.get("price")) if ref_ok else "—"),
                 "    Vol/ATR%     : " + str(e.get("volume", "—")) + "% / " + "{:.1f}".format(safe_float(e.get("atr_pct", 0))) + "%",
                 "    RSI          : " + str(e.get("rsi", "—")),
                 "    RelVol       : " + str(e.get("rel_vol", "—")),
                 "    Trend Str    : " + str(e.get("trend_strength", 0)),
                 "    Comp. Score  : " + str(e.get("composite_score", 0)) + "/100",
-                "    Risk:Reward  : " + str(e.get("risk_reward", 0)) + ":1",
+                "    Ref Risk:Reward: " + rr_text,
                 "    EMA Align    : " + str(e.get("ema_alignment", "—")),
                 "    MACD Cross   : " + str(e.get("macd_cross", "—")),
                 "    SuperTrend   : " + ("BULL" if e.get("st_direction") == 1 else
@@ -5576,16 +5696,31 @@ def export_report(data, tfs=None):
                     "    52W Low      : ₹{} ({:+.1f}%)".format(w52.get("low_52w","—"),  safe_float(w52.get("pct_from_low"),  0.0)),
                 ]
             tgt = as_dict(e.get("targets"))
-            if tgt:
+            if tgt and ref_ok:
                 lines += [
                     "    Target 1     : ₹" + str(tgt.get("target1", "—")),
                     "    Target 2     : ₹" + str(tgt.get("target2", "—")),
                     "    Stop Loss    : ₹" + str(tgt.get("stop", "—")),
                 ]
+            elif tgt:
+                lines.append("    Reference targets unavailable without a valid reference price.")
             supp = as_list(e.get("support"))
             res  = as_list(e.get("resistance"))
             if supp: lines.append("    Support      : " + ", ".join("₹" + str(s) for s in supp))
             if res:  lines.append("    Resistance   : " + ", ".join("₹" + str(r) for r in res))
+            if (str(e.get("signal")) in ("BREAKOUT", "BREAKDOWN", "SIDEWAYS") or
+                    (str(e.get("signal")) == "NONE" and is_scanned_entry(e))):
+                setups = get_conditional_entries(e, tf)
+                lines.append("    Conditional entries (candle: " +
+                             str(e.get("candle_date") or "unavailable") + "; scan: " +
+                             str(e.get("updated") or "unavailable") + " IST):")
+                for setup in (setups["breakout"], setups["pullback"]):
+                    lines.append("      " + setup["label"] + ": " + setup["when"])
+                lines.append("      " + ENTRY_CONDITION_NOTE)
+                if tgt and ref_ok:
+                    lines.append("      Reference targets, stop and R:R use the latest stored "
+                                 "candle close, which may be unfinished; they are not "
+                                 "entry-specific estimates.")
             if e.get("note"):
                 lines.append("    Note         : " + str(e["note"]))
             if e.get("signal_changed"):
@@ -5645,8 +5780,16 @@ def export_html(data, tfs=None):
     def safe(v, d=0.0):
         try:
             r = float(v)
-            return d if (r != r) else r
+            return r if math.isfinite(r) else d
         except Exception: return d
+
+    def has_price(entry):
+        return _valid_reference_price(as_dict(entry).get("price", 0))
+
+    def report_tf(entry):
+        # Match the scanner's primary-TF priority, but reject invalid prices.
+        return next((tf for tf in ("DAY", "WEEK", "MONTH", "1HR", "15MIN", "5MIN")
+                     if has_price(entry.get(tf))), _score_tf_key(entry, tfs))
 
     def esc(v):
         """HTML-escape interpolated text.
@@ -5690,10 +5833,22 @@ def export_html(data, tfs=None):
         elif s == "SIDEWAYS": sectors[sec]["SW"] += 1
         else:                 sectors[sec]["N"]  += 1
 
-    # Sort all symbols by DAY composite score desc
+    # The DAY dashboard stays DAY-only. Detail cards also need scanned
+    # intraday/weekly-only symbols, otherwise all-TF links have no target and
+    # their conditional entry rules are inaccessible.
     ranked = sorted(
-        [(sym,e) for sym,e in data.items() if as_dict(e.get("DAY")).get("price",0)],
+        [(sym, e) for sym, e in data.items() if has_price(e.get("DAY"))],
         key=lambda x: safe(as_dict(x[1].get("DAY")).get("composite_score", 0)), reverse=True)
+    day_symbols = {sym for sym, _ in ranked}
+    other_details = [
+        (sym, e) for sym, e in data.items() if sym not in day_symbols
+        and any(has_price(e.get(tf)) or
+                str(as_dict(e.get(tf)).get("signal") or "NONE") != "NONE"
+                for tf in TF_CONFIG)
+    ]
+    other_details.sort(key=lambda x: safe(as_dict(x[1].get(report_tf(x[1])))
+                                         .get("composite_score", 0)), reverse=True)
+    detail_ranked = ranked + other_details
 
     # ── Build HTML ────────────────────────────────────────────
     H = []
@@ -5840,6 +5995,21 @@ tr:last-child td{border-bottom:none}
   padding:8px 12px;font-family:var(--mono);font-size:13.5px}
 .tgt-lbl{font-size:11px;color:var(--mu);display:block;margin-bottom:2px;
   text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.tgt-context{font-size:12.5px;color:var(--mu);margin:3px 0 4px}
+/* ── CONDITIONAL ENTRY SETUPS ── */
+.report-note{background:var(--bld);border:1px solid rgba(63,216,255,.25);
+  border-radius:8px;padding:12px 15px;margin-bottom:18px;color:var(--tx);font-size:13px}
+.entry-plans{padding:14px;border-top:1px solid var(--bd);background:rgba(63,216,255,.025)}
+.entry-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 12px;margin-bottom:10px}
+.entry-heading strong{font-size:14px;color:var(--bl)}
+.entry-time{font-size:12px;color:var(--mu)}
+.entry-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:10px}
+.entry-option{min-width:0;background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:10px 12px}
+.entry-option-title{font-size:13px;font-weight:700;color:var(--tx)}
+.entry-level{font:700 17px var(--mono);color:var(--ye);margin:5px 0}
+.entry-level span{font:400 12px var(--sans);color:var(--mu);margin-left:5px}
+.entry-condition{font-size:13px;color:var(--tx);overflow-wrap:anywhere}
+.entry-note{font-size:12.5px;color:var(--mu);margin-top:10px}
 /* ── GAP PREDICTION ── */
 .gap-bar-wrap{background:rgba(255,255,255,.07);border-radius:5px;height:10px;overflow:hidden;flex:1}
 .gap-bar-fill{height:10px;border-radius:5px}
@@ -5902,8 +6072,8 @@ tr:last-child td{border-bottom:none}
 
     # ── SIDE NAV ─────────────────────────────────────────────
     w('<div class="nav"><div class="nav-title">Symbols</div>')
-    for sym, e in ranked:
-        sig = as_dict(e.get("DAY")).get("signal", "NONE")
+    for sym, e in detail_ranked:
+        sig = as_dict(e.get(report_tf(e))).get("signal", "NONE")
         w('<a href="#' + symbol_fragment(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
     w('</div>')
 
@@ -5916,6 +6086,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="card ye"><div class="card-lbl">All-TF Breakout</div><div class="card-val">' + str(len(all_bo_syms)) + '</div><div class="card-sub">' + ', '.join(tfs) + ' aligned</div></div>')
     w('<div class="card bl"><div class="card-lbl">All-TF Breakdown</div><div class="card-val">' + str(len(all_bd_syms)) + '</div><div class="card-sub">' + (', '.join(esc(s) for s in all_bd_syms[:3]) or 'None') + '</div></div>')
     w('</div>')
+    w('<p class="report-note"><strong>Snapshot, not a trade:</strong> Reference prices and R:R use the latest stored candle close, which may be unfinished. Conditional entries below are not monitored live or guaranteed fills.</p>')
 
     # ── SECTOR HEATMAP + BEST SETUPS ─────────────────────────
     w('<div class="g2">')
@@ -5944,13 +6115,15 @@ tr:last-child td{border-bottom:none}
     # All-TF Breakout table
     w('<div class="sec"><div class="sec-title">All-TF Breakout Setups <span>' + '+'.join(tfs) + '</span></div>')
     w('<div style="overflow-x:auto"><table><thead><tr>')
-    for h in ["Symbol","Score","Price","RSI","RVol","R:R","Candle"]:
+    for h in ["Symbol","Metric TF","Score","Price","RSI","RVol","Ref R:R","Candle"]:
         w('<th>' + h + '</th>')
     w('</tr></thead><tbody>')
     allbo_data = [(sym, data[sym]) for sym in all_bo_syms if sym in data]
-    allbo_data.sort(key=lambda x: safe(as_dict(x[1].get("DAY")).get("composite_score", 0)), reverse=True)
+    allbo_data.sort(key=lambda x: safe(as_dict(x[1].get(report_tf(x[1])))
+                                       .get("composite_score", 0)), reverse=True)
     for sym, e in allbo_data:
-        de = as_dict(e.get("DAY"))
+        metric_tf = report_tf(e)
+        de = as_dict(e.get(metric_tf))
         cs = int(safe(de.get("composite_score",0)))
         sc_col = "var(--gr)" if cs >= 65 else ("var(--ye)" if cs >= 40 else "var(--re)")
         rsi = safe(de.get("rsi",0))
@@ -5961,6 +6134,10 @@ tr:last-child td{border-bottom:none}
         rr_col = "var(--gr)" if rr>=1 else ("var(--ye)" if rr>=0.5 else "var(--re)")
         chips = "".join('<span class="chip">' + esc(p) + '</span>' for p in cps) if cps else '<span class="mu">—</span>'
         w('<tr><td><a href="#' + symbol_fragment(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
+        w('<td class="mono">' + esc(metric_tf) + '</td>')
+        if not has_price(de):
+            w('<td colspan="6" class="mu">Reference data unavailable</td></tr>')
+            continue
         w('<td><div class="sbar-num" style="color:' + sc_col + '">' + str(cs) + '</div><div class="sbar-wrap"><div class="sbar-bg"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></div></td>')
         w('<td class="mono">' + fmt_p(de.get("price",0)) + '</td>')
         w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
@@ -5974,7 +6151,7 @@ tr:last-child td{border-bottom:none}
     # ── DASHBOARD TABLE ──────────────────────────────────────
     w('<div class="sec"><div class="sec-title">All Symbols — DAY Timeframe <span>Sorted by Composite Score</span></div>')
     w('<div style="overflow-x:auto"><table><thead><tr>')
-    for h in ["Symbol","Signal"] + list(tfs) + ["Score","Price","RSI","RVol","R:R","EMA","Candle"]:
+    for h in ["Symbol","Signal"] + list(tfs) + ["Score","Price","RSI","RVol","Ref R:R","EMA","Candle"]:
         w('<th>' + esc(h) + '</th>')
     w('</tr></thead><tbody>')
     for sym, e in ranked:
@@ -6009,20 +6186,23 @@ tr:last-child td{border-bottom:none}
     # ── PER-SYMBOL DETAIL CARDS ───────────────────────────────
     w('<h2 style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--tx);letter-spacing:0;text-transform:none;margin:28px 0 14px">Symbol Detail Cards</h2>')
 
-    for sym, e in ranked:
+    for sym, e in detail_ranked:
         sec     = SECTOR_MAP.get(sym,"")
         conf    = confluence_score(e, tfs)
         conf_lbl_map = {3:"STRONG BULL",2:"BULL",1:"WEAK BULL",0:"NEUTRAL",-1:"WEAK BEAR",-2:"BEAR"}
         conf_str = conf_lbl_map.get(conf, ("STRONG BULL" if conf>3 else "STRONG BEAR"))
         conf_col = "var(--gr)" if conf>=2 else ("var(--re)" if conf<=-2 else "var(--ye)")
-        day_e   = as_dict(e.get("DAY"))
-        price   = safe(day_e.get("price",0))
+        primary_tf = report_tf(e)
+        primary = as_dict(e.get(primary_tf))
+        price = safe(primary.get("price", 0))
+        price_desc = (fmt_p(price) + ' · ' + esc(primary_tf) + ' candle close'
+                      if has_price(primary) else 'Reference price unavailable')
 
         w('<div class="det-card" id="sym-' + esc(sym) + '">')
         w('<div class="det-hdr">')
         w('  <div>')
         w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:15px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
-        w('    <div class="det-meta">' + fmt_p(price) + ' &nbsp;·&nbsp; Confluence: <span style="color:' + conf_col + ';font-weight:700">' + conf_str + ' (' + ('+' if conf>=0 else '') + str(conf) + ')</span></div>')
+        w('    <div class="det-meta">' + price_desc + ' &nbsp;·&nbsp; Confluence: <span style="color:' + conf_col + ';font-weight:700">' + conf_str + ' (' + ('+' if conf>=0 else '') + str(conf) + ')</span></div>')
         w('  </div>')
         w('  <div class="tfdots">')
         for tf in list(TF_CONFIG.keys()):
@@ -6058,7 +6238,7 @@ tr:last-child td{border-bottom:none}
             w('<td><div style="color:' + sc_col + ';font-family:var(--mono);font-size:13px">' + str(cs) + '</div><div class="sbar-bg" style="width:45px;margin-top:2px"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></td>')
             w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
             w('<td class="mono" style="color:' + rv_col + '">' + str(rv) + '×</td>')
-            w('<td class="mono">' + fmt_p(pr) + '</td>')
+            w('<td class="mono">' + (fmt_p(pr) if has_price(te) else '—') + '</td>')
             w('<td style="font-size:12px;color:var(--mu)">' + esc(cd) + '</td></tr>')
         w('</tbody></table></div>')
 
@@ -6066,7 +6246,9 @@ tr:last-child td{border-bottom:none}
         for tf in tf_order:
             te  = as_dict(e[tf])
             sig = te.get("signal","NONE")
-            if sig == "NONE": continue
+            # A scanned but directionless timeframe should explain why no
+            # conditions are available; omit only empty placeholders.
+            if sig == "NONE" and not has_price(te): continue
             atr   = safe(te.get("atr",0))
             atrp  = safe(te.get("atr_pct",0))
             cs    = int(safe(te.get("composite_score",0)))
@@ -6098,7 +6280,8 @@ tr:last-child td{border-bottom:none}
             w('<span style="color:var(--ye)">' + tf + '</span>')
             w('<span class="badge ' + sc(sig) + '">' + esc(str(sig)) + '</span>')
             w('<span style="color:' + sc_col + ';font-size:13px">' + str(cs) + '/100</span>')
-            w('<span style="color:var(--mu);font-size:12px;font-weight:400;margin-left:auto">R:R <span style="color:' + ("var(--gr)" if rr>=1 else "var(--ye)") + '">' + str(rr) + ':1</span></span>')
+            rr_text = str(rr) + ':1' if has_price(te) else '—'
+            w('<span style="color:var(--mu);font-size:12px;font-weight:400;margin-left:auto">Ref R:R <span style="color:' + ("var(--gr)" if rr>=1 and has_price(te) else "var(--ye)") + '">' + rr_text + '</span></span>')
             w('</div>')
             if reason:
                 w('<div class="reason" style="padding:4px 12px">' + esc(reason.replace("|"," · ")) + '</div>')
@@ -6124,12 +6307,37 @@ tr:last-child td{border-bottom:none}
                 if tgt:
                     t1 = tgt.get("target1",""); t2 = tgt.get("target2",""); sl = tgt.get("stop","")
                     w('<div class="tgt-row">')
-                    w('<div class="tgt-box"><span class="tgt-lbl">Entry</span><span class="mono">' + fmt_p(pr) + '</span></div>')
-                    if t1: w('<div class="tgt-box"><span class="tgt-lbl">Target 1</span><span class="mono gr">' + fmt_p(t1) + '</span></div>')
-                    if t2: w('<div class="tgt-box"><span class="tgt-lbl">Target 2</span><span class="mono gr">' + fmt_p(t2) + '</span></div>')
-                    if sl: w('<div class="tgt-box"><span class="tgt-lbl">Stop Loss</span><span class="mono re">' + fmt_p(sl) + '</span></div>')
+                    w('<div class="tgt-box"><span class="tgt-lbl">Reference price</span><span class="mono">' + (fmt_p(pr) if has_price(te) else '—') + '</span></div>')
+                    if has_price(te):
+                        if t1: w('<div class="tgt-box"><span class="tgt-lbl">Target 1</span><span class="mono gr">' + fmt_p(t1) + '</span></div>')
+                        if t2: w('<div class="tgt-box"><span class="tgt-lbl">Target 2</span><span class="mono gr">' + fmt_p(t2) + '</span></div>')
+                        if sl: w('<div class="tgt-box"><span class="tgt-lbl">Stop Loss</span><span class="mono re">' + fmt_p(sl) + '</span></div>')
                     w('</div>')
+                    if has_price(te):
+                        w('<p class="tgt-context">Reference targets, stop and R:R assume the latest stored candle close (which may be unfinished), not a conditional entry or actual fill.</p>')
+                    else:
+                        w('<p class="tgt-context">Reference price unavailable; stored targets, stop and R:R cannot be evaluated.</p>')
                 w('</div>')
+
+            # Conditional levels are frozen to this scan. They are not fills
+            # and are deliberately separate from the close-based targets above.
+            setups = get_conditional_entries(te, tf)
+            w('<section class="entry-plans" aria-label="Conditional entries for ' + esc(tf) + '">')
+            w('<div class="entry-heading"><strong>Conditional entries · ' + esc(tf) + '</strong>')
+            w('<span class="entry-time">Candle: ' + esc(te.get("candle_date") or "unavailable") +
+              ' · Scan: ' + esc(te.get("updated") or "unavailable") + ' IST</span></div>')
+            w('<div class="entry-grid">')
+            for kind in ("breakout", "pullback"):
+                setup = setups[kind]
+                w('<div class="entry-option"><div class="entry-option-title">' + esc(setup["label"]) + '</div>')
+                if setup["level"] is not None:
+                    is_resistance = ((setups["direction"] == "BULLISH") == (kind == "breakout"))
+                    source = "nearest resistance" if is_resistance else "nearest support"
+                    w('<div class="entry-level">' + fmt_p(setup["level"]) + '<span>' + source + '</span></div>')
+                else:
+                    w('<div class="entry-level">Unavailable</div>')
+                w('<div class="entry-condition">' + esc(setup["when"]) + '</div></div>')
+            w('</div><p class="entry-note">' + esc(ENTRY_CONDITION_NOTE) + '</p></section>')
 
             # Candle + Fib + 52W + divergence
             extras = []
@@ -6160,8 +6368,8 @@ tr:last-child td{border-bottom:none}
             if div_.get("regular_bear"): div_items.append('<span style="color:var(--re)">Reg.Bear▼</span>')
             if div_.get("hidden_bear"):  div_items.append('<span style="color:var(--re)">Hid.Bear▼</span>')
             if div_items: extras.append('<span style="font-size:12px;color:var(--mu)">RSI Div:</span> ' + " ".join(div_items))
-            if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT R1=₹' + esc(str(te.get("retest_bo_level",""))) + '</span>')
-            if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN S1=₹' + esc(str(te.get("retest_bd_level",""))) + '</span>')
+            if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT (scan indicator) R1=₹' + esc(str(te.get("retest_bo_level",""))) + '</span>')
+            if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN (scan indicator) S1=₹' + esc(str(te.get("retest_bd_level",""))) + '</span>')
 
             if extras:
                 w('<div style="padding:6px 12px;border-top:1px solid var(--bd);display:flex;flex-wrap:wrap;gap:10px">')
@@ -6171,24 +6379,28 @@ tr:last-child td{border-bottom:none}
             w('</div>')  # tf-block
 
         # Next-day gap prediction
-        gap_score, gap_bias, gap_facts = calc_next_day_gap_score(e)
-        gb_col = "var(--gr)" if gap_bias=="GAP_UP" else ("var(--re)" if gap_bias=="GAP_DOWN" else "var(--ye)")
-        gb_str = ("▲ GAP-UP BIAS" if gap_bias=="GAP_UP" else ("▼ GAP-DOWN BIAS" if gap_bias=="GAP_DOWN" else "— NEUTRAL / WAIT"))
-        bar_pct = gap_score
-        bar_col = "var(--gr)" if gap_score>=62 else ("var(--re)" if gap_score<=38 else "var(--ye)")
+        if not has_price(e.get("DAY")):
+            w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
+            w('<div class="gap-context">DAY data unavailable; no gap score calculated.</div></div>')
+        else:
+            gap_score, gap_bias, gap_facts = calc_next_day_gap_score(e)
+            gb_col = "var(--gr)" if gap_bias=="GAP_UP" else ("var(--re)" if gap_bias=="GAP_DOWN" else "var(--ye)")
+            gb_str = ("▲ GAP-UP BIAS" if gap_bias=="GAP_UP" else ("▼ GAP-DOWN BIAS" if gap_bias=="GAP_DOWN" else "— NEUTRAL / WAIT"))
+            bar_pct = gap_score
+            bar_col = "var(--gr)" if gap_score>=62 else ("var(--re)" if gap_score<=38 else "var(--ye)")
 
-        w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
-        w('<div class="gap-context">Gap-up bias score (0–100%), not a calibrated probability; lower scores indicate gap-down bias.</div>')
-        w('<div class="gap-row">')
-        w('<div class="gap-score" style="color:' + gb_col + '">' + str(gap_score) + '%</div>')
-        w('<div class="gap-bar-wrap"><div class="gap-bar-fill" style="width:' + str(bar_pct) + '%;background:' + bar_col + '"></div></div>')
-        w('<div class="gap-bias" style="color:' + gb_col + '">' + gb_str + '</div>')
-        w('</div><div class="gap-facts">')
-        for lbl, pts in sorted(gap_facts, key=lambda x: -abs(x[1])):
-            fc = "var(--gr)" if pts>0 else ("var(--re)" if pts<0 else "var(--mu)")
-            sign = "+" if pts>=0 else ""
-            w('<div class="gap-fact"><span class="gap-pts" style="color:' + fc + '">' + sign + str(pts) + 'pts</span><span>' + esc(lbl) + '</span></div>')
-        w('</div></div>')
+            w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
+            w('<div class="gap-context">Gap-up bias score (0–100%), not a calibrated probability; lower scores indicate gap-down bias.</div>')
+            w('<div class="gap-row">')
+            w('<div class="gap-score" style="color:' + gb_col + '">' + str(gap_score) + '%</div>')
+            w('<div class="gap-bar-wrap"><div class="gap-bar-fill" style="width:' + str(bar_pct) + '%;background:' + bar_col + '"></div></div>')
+            w('<div class="gap-bias" style="color:' + gb_col + '">' + gb_str + '</div>')
+            w('</div><div class="gap-facts">')
+            for lbl, pts in sorted(gap_facts, key=lambda x: -abs(x[1])):
+                fc = "var(--gr)" if pts>0 else ("var(--re)" if pts<0 else "var(--mu)")
+                sign = "+" if pts>=0 else ""
+                w('<div class="gap-fact"><span class="gap-pts" style="color:' + fc + '">' + sign + str(pts) + 'pts</span><span>' + esc(lbl) + '</span></div>')
+            w('</div></div>')
 
         # Stock summary (buy/sell reasons)
         s = generate_stock_summary(sym, e, tfs)
@@ -6199,6 +6411,7 @@ tr:last-child td{border-bottom:none}
         w('  VERDICT: ' + verdict + ' &nbsp;·&nbsp; ' + s["confidence"] + ' CONFIDENCE')
         w('</div>')
         w('<div style="font-size:12px;color:var(--mu);margin-bottom:8px">' + esc(s["headline"]) + '</div>')
+        w('<div class="gap-context">' + esc(s["action"]) + '</div>')
         if s["buy_reasons"]:
             w('<div class="reason-list">')
             for r in s["buy_reasons"]:

@@ -133,7 +133,7 @@ def test_trade_levels_keep_paisa_even_for_high_price_stocks(mod, monkeypatch, tm
     e = _entry(mod, price=11175.25,
                targets={"target1": 11546.16, "target2": 11917.32, "stop": 10612.03})
     html = _render(mod, monkeypatch, tmp_path, {"ULTRACEMCO": {"DAY": e}})
-    assert '<span class="tgt-lbl">Entry</span><span class="mono">₹11,175.25</span>' in html
+    assert '<span class="tgt-lbl">Reference price</span><span class="mono">₹11,175.25</span>' in html
     assert '<span class="tgt-lbl">Target 1</span><span class="mono gr">₹11,546.16</span>' in html
     assert '<span class="tgt-lbl">Stop Loss</span><span class="mono re">₹10,612.03</span>' in html
 
