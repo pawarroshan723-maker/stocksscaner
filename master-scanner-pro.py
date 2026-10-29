@@ -5689,142 +5689,186 @@ def export_html(data, tfs=None):
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Master Scanner Report""" + " — " + gen + """</title>
 <style>
-:root{--bg:#0a0c0f;--s1:#111318;--s2:#181c23;--bd:#1e2330;
-  --gr:#00d68f;--grd:#00d68f22;--re:#ff4757;--red:#ff475720;
-  --ye:#ffd32a;--yed:#ffd32a18;--bl:#2ed8ff;--bld:#2ed8ff15;
-  --tx:#e8eaf0;--mu:#5a6278;--mono:'Courier New',monospace;--sans:system-ui,sans-serif}
+/* ── Master Scanner Pro — dashboard theme (v2: readable, hi-DPI sharp) ── */
+:root{
+  --bg:#0b0e15; --s1:#121724; --s2:#1a2133; --bd:#273047;
+  --gr:#25e6a0; --grd:rgba(37,230,160,.13); --re:#ff5c72; --red:rgba(255,92,114,.13);
+  --ye:#ffcb3d; --yed:rgba(255,203,61,.13); --bl:#3fd8ff; --bld:rgba(63,216,255,.13);
+  --tx:#eef1f8; --mu:#97a1bb;
+  --mono:"Cascadia Mono",Consolas,"SF Mono","Roboto Mono",Menlo,monospace;
+  --sans:"Segoe UI",Inter,-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",Arial,sans-serif;
+  --rad:10px; --sh:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.20);
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px}
+html{font-size:16px;scroll-behavior:smooth;scroll-padding-top:70px}
+body{
+  background:var(--bg);
+  background-image:
+    radial-gradient(1100px 520px at 12% -8%, rgba(63,216,255,.07), transparent 60%),
+    radial-gradient(900px 480px at 88% 0%, rgba(37,230,160,.06), transparent 55%);
+  background-attachment:fixed;
+  color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  text-rendering:optimizeLegibility}
 a{color:var(--bl);text-decoration:none}
-/* LAYOUT */
-.wrap{max-width:1440px;margin:0 auto;padding:16px 20px}
-.hdr{background:var(--s1);border-bottom:1px solid var(--bd);padding:14px 20px;
-  display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100}
-.hdr-logo{font-family:var(--mono);font-size:11px;letter-spacing:.12em;color:var(--mu)}
+a:hover{text-decoration:underline}
+/* ── HEADER ── */
+.wrap{max-width:1400px;margin:0 auto;padding:22px 26px 10px}
+.hdr{background:rgba(18,23,36,.93);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--bd);padding:13px 26px;
+  display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+  position:sticky;top:0;z-index:100;box-shadow:0 2px 14px rgba(0,0,0,.35)}
+.hdr-logo{font-family:var(--mono);font-size:14.5px;letter-spacing:.05em;color:var(--tx);font-weight:600}
 .hdr-logo b{color:var(--gr)}
-.hdr-ts{font-family:var(--mono);font-size:10px;color:var(--mu)}
-/* CARDS ROW */
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
-.card{background:var(--s1);border:1px solid var(--bd);border-radius:6px;padding:14px;position:relative;overflow:hidden}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.card.gr::before{background:var(--gr)}.card.re::before{background:var(--re)}
-.card.ye::before{background:var(--ye)}.card.bl::before{background:var(--bl)}
-.card-lbl{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px}
-.card-val{font-family:var(--mono);font-size:30px;font-weight:700;line-height:1;margin-bottom:3px}
+.hdr-ts{font-family:var(--mono);font-size:12.5px;color:var(--mu)}
+/* ── STAT CARDS ── */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px;margin-bottom:18px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.025),transparent 55%),var(--s1);
+  border:1px solid var(--bd);border-radius:var(--rad);padding:16px 18px;position:relative;
+  overflow:hidden;box-shadow:var(--sh);transition:transform .15s ease,box-shadow .15s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 10px rgba(0,0,0,.45),0 12px 28px rgba(0,0,0,.28)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.card.gr::before{background:linear-gradient(90deg,var(--gr),rgba(37,230,160,0))}
+.card.re::before{background:linear-gradient(90deg,var(--re),rgba(255,92,114,0))}
+.card.ye::before{background:linear-gradient(90deg,var(--ye),rgba(255,203,61,0))}
+.card.bl::before{background:linear-gradient(90deg,var(--bl),rgba(63,216,255,0))}
+.card-lbl{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--mu);margin-bottom:8px}
+.card-val{font-family:var(--mono);font-size:34px;font-weight:700;line-height:1.05;margin-bottom:4px}
 .card.gr .card-val{color:var(--gr)}.card.re .card-val{color:var(--re)}
 .card.ye .card-val{color:var(--ye)}.card.bl .card-val{color:var(--bl)}
-.card-sub{font-size:11px;color:var(--mu)}
-/* SECTION */
-.sec{background:var(--s1);border:1px solid var(--bd);border-radius:6px;padding:16px;margin-bottom:14px}
-.sec-title{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--mu);padding-bottom:8px;border-bottom:1px solid var(--bd);margin-bottom:12px;
-  display:flex;align-items:center;justify-content:space-between}
-.sec-title span{color:var(--tx)}
-/* GRID 2-col */
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
-.g3{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:14px}
-/* BADGES */
-.badge{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;
-  letter-spacing:.05em;padding:2px 6px;border-radius:3px}
-.badge.bo{background:var(--grd);color:var(--gr);border:1px solid #00d68f44}
-.badge.bd{background:var(--red);color:var(--re);border:1px solid #ff475740}
-.badge.sw{background:var(--yed);color:var(--ye);border:1px solid #ffd32a30}
+.card-sub{font-size:13px;color:var(--mu)}
+/* ── SECTIONS ── */
+.sec{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rad);
+  padding:18px 20px;margin-bottom:16px;box-shadow:var(--sh)}
+.sec-title{font-size:15px;font-weight:700;color:var(--tx);
+  padding-bottom:10px;border-bottom:1px solid var(--bd);margin-bottom:14px;
+  display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.sec-title span{color:var(--mu);font-size:12.5px;font-weight:500}
+/* ── GRIDS ── */
+.g2{display:grid;grid-template-columns:repeat(auto-fit,minmax(370px,1fr));gap:16px;margin-bottom:16px}
+.g3{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
+/* ── BADGES ── */
+.badge{display:inline-block;font-family:var(--mono);font-size:11.5px;font-weight:700;
+  letter-spacing:.03em;padding:3px 9px;border-radius:5px;white-space:nowrap}
+.badge.bo{background:var(--grd);color:var(--gr);border:1px solid rgba(37,230,160,.35)}
+.badge.bd{background:var(--red);color:var(--re);border:1px solid rgba(255,92,114,.35)}
+.badge.sw{background:var(--yed);color:var(--ye);border:1px solid rgba(255,203,61,.3)}
 .badge.none{background:var(--s2);color:var(--mu);border:1px solid var(--bd)}
-/* TF dots */
-.tfdots{display:flex;gap:3px}
-.tfd{width:20px;height:20px;border-radius:3px;font-family:var(--mono);font-size:7px;
+/* ── TF DOTS ── */
+.tfdots{display:flex;gap:5px;flex-wrap:wrap}
+.tfd{width:28px;height:28px;border-radius:6px;font-family:var(--mono);font-size:11px;
   font-weight:700;display:flex;align-items:center;justify-content:center}
 .tfd.bo{background:var(--grd);color:var(--gr)}.tfd.bd{background:var(--red);color:var(--re)}
 .tfd.sw{background:var(--yed);color:var(--ye)}.tfd.none{background:var(--s2);color:var(--mu)}
-/* TABLE */
-table{width:100%;border-collapse:collapse}
-th{font-family:var(--mono);font-size:9px;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--mu);text-align:left;padding:6px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}
-td{padding:6px 8px;border-bottom:1px solid #13161e;vertical-align:middle}
+/* ── TABLES ── */
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{font-family:var(--mono);font-size:12px;letter-spacing:.05em;text-transform:uppercase;
+  color:#8f99b5;text-align:left;padding:9px 12px;border-bottom:2px solid var(--bd);
+  white-space:nowrap;font-weight:700}
+td{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.055);vertical-align:middle;font-size:14px}
+tbody tr:nth-child(even){background:rgba(255,255,255,.015)}
 tr:hover td{background:var(--s2)}
 tr:last-child td{border-bottom:none}
-.sym{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--tx)}
-.sec-tag{font-size:9px;color:var(--mu);display:block}
-.mono{font-family:var(--mono);font-size:11px}
+.sym{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--tx)}
+.sec-tag{font-size:11.5px;color:var(--mu);display:block}
+.mono{font-family:var(--mono);font-size:13.5px}
 .gr{color:var(--gr)}.re{color:var(--re)}.ye{color:var(--ye)}.mu{color:var(--mu)}
-/* SCORE BAR */
-.sbar-wrap{width:55px}
-.sbar-num{font-family:var(--mono);font-size:10px;margin-bottom:2px}
-.sbar-bg{background:var(--s2);border-radius:2px;height:4px;overflow:hidden}
-.sbar-fill{height:4px;border-radius:2px}
-/* RSI PILL */
-.rsi-p{display:inline-block;font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:10px}
-.rsi-ob{background:#ff475718;color:var(--re)}.rsi-bull{background:var(--grd);color:var(--gr)}
+/* ── SCORE BAR ── */
+.sbar-wrap{width:64px}
+.sbar-num{font-family:var(--mono);font-size:13px;font-weight:600;margin-bottom:3px}
+.sbar-bg{background:rgba(255,255,255,.07);border-radius:3px;height:6px;overflow:hidden}
+.sbar-fill{height:6px;border-radius:3px}
+/* ── RSI PILL ── */
+.rsi-p{display:inline-block;font-family:var(--mono);font-size:12.5px;font-weight:600;
+  padding:2px 8px;border-radius:12px;min-width:40px;text-align:center}
+.rsi-ob{background:var(--red);color:var(--re)}.rsi-bull{background:var(--grd);color:var(--gr)}
 .rsi-mid{background:var(--yed);color:var(--ye)}.rsi-os{background:var(--bld);color:var(--bl)}
-/* SECTOR HEATMAP */
-.sec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
-.sec-cell{background:var(--s2);border:1px solid var(--bd);border-radius:4px;padding:10px}
-.sec-name{font-size:9px;font-weight:600;color:var(--mu);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
-.sec-bars{display:flex;gap:2px;height:22px;align-items:flex-end;margin-bottom:4px}
-.sec-bar{border-radius:2px 2px 0 0;flex:0 0 14px;min-height:2px}
-.sec-counts{display:flex;gap:6px;font-family:var(--mono);font-size:9px}
-/* DETAIL CARD */
-.det-card{background:var(--s1);border:1px solid var(--bd);border-radius:6px;
-  margin-bottom:12px;overflow:hidden}
-.det-hdr{padding:12px 16px;border-bottom:1px solid var(--bd);
-  display:flex;align-items:center;justify-content:space-between;
-  background:var(--s2)}
-.det-sym{font-family:var(--mono);font-size:16px;font-weight:700}
-.det-meta{font-size:11px;color:var(--mu)}
-.det-body{padding:14px 16px}
-/* TF BLOCK */
-.tf-block{border:1px solid var(--bd);border-radius:4px;margin-bottom:8px;overflow:hidden}
-.tf-block-hdr{padding:8px 12px;background:var(--s2);display:flex;align-items:center;gap:10px;
-  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:11px;font-weight:700}
-.tf-block-body{padding:10px 12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-.tf-kv{font-size:11px}
-.tf-kv-lbl{color:var(--mu);font-size:9px;margin-bottom:1px;text-transform:uppercase;letter-spacing:.06em}
-.tf-kv-val{font-family:var(--mono);font-size:11px}
-/* REASON TAG */
-.reason{font-size:10px;color:var(--mu);font-style:italic;padding:3px 0 6px;border-bottom:1px solid #13161e;margin-bottom:8px}
-/* TARGETS ROW */
-.tgt-row{display:flex;gap:12px;flex-wrap:wrap;padding:8px 0;border-top:1px solid #13161e;margin-top:6px}
-.tgt-box{background:var(--s2);border-radius:4px;padding:6px 10px;font-family:var(--mono);font-size:11px}
-.tgt-lbl{font-size:8px;color:var(--mu);display:block;margin-bottom:2px;text-transform:uppercase;letter-spacing:.08em}
-/* GAP PREDICTION */
-.gap-bar-wrap{background:var(--s2);border-radius:3px;height:8px;overflow:hidden;flex:1}
-.gap-bar-fill{height:8px;border-radius:3px}
-.gap-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-.gap-score{font-family:var(--mono);font-size:22px;font-weight:700;min-width:50px}
-.gap-bias{font-family:var(--mono);font-size:13px;font-weight:700}
-.gap-facts{margin-top:6px}
-.gap-fact{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:11px}
-.gap-pts{font-family:var(--mono);font-size:11px;font-weight:700;min-width:40px}
-/* STOCK SUMMARY */
-.verdict-banner{padding:10px 14px;border-radius:4px;font-family:var(--mono);
-  font-size:14px;font-weight:700;margin-bottom:10px}
-.verdict-buy{background:var(--grd);color:var(--gr);border:1px solid #00d68f44}
-.verdict-sell{background:var(--red);color:var(--re);border:1px solid #ff475740}
-.verdict-hold{background:var(--yed);color:var(--ye);border:1px solid #ffd32a30}
-.reason-list{margin-bottom:10px}
-.reason-item{display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:11px;
-  border-bottom:1px solid #13161e}
+/* ── SECTOR HEATMAP ── */
+.sec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.sec-cell{background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:12px}
+.sec-name{font-size:12px;font-weight:600;color:var(--mu);margin-bottom:8px;
+  text-transform:uppercase;letter-spacing:.04em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sec-bars{display:flex;gap:3px;height:46px;align-items:flex-end;margin-bottom:6px}
+.sec-bar{border-radius:3px 3px 0 0;flex:0 0 16px;min-height:2px}
+.sec-counts{display:flex;gap:8px;font-family:var(--mono);font-size:12px;font-weight:600}
+/* ── DETAIL CARDS ── */
+.det-card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rad);
+  margin-bottom:14px;overflow:hidden;box-shadow:var(--sh)}
+.det-hdr{padding:16px 20px;border-bottom:1px solid var(--bd);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  background:linear-gradient(180deg,rgba(63,216,255,.05),transparent),var(--s2)}
+.det-sym{font-family:var(--mono);font-size:21px;font-weight:700;letter-spacing:.02em}
+.det-meta{font-size:13.5px;color:var(--mu);margin-top:2px}
+.det-body{padding:18px 20px}
+/* ── TF BLOCKS ── */
+.tf-block{border:1px solid var(--bd);border-radius:8px;margin-bottom:10px;overflow:hidden}
+.tf-block-hdr{padding:10px 14px;background:var(--s2);display:flex;align-items:center;gap:12px;
+  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:14px;font-weight:700}
+.tf-block-body{padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.tf-kv{font-size:13.5px}
+.tf-kv-lbl{color:var(--mu);font-size:11.5px;margin-bottom:2px;
+  text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.tf-kv-val{font-family:var(--mono);font-size:13.5px}
+/* ── REASONS ── */
+.reason{font-size:13px;color:#a7b0c8;font-style:italic;padding:4px 0 9px;
+  border-bottom:1px solid rgba(255,255,255,.055);margin-bottom:10px}
+/* ── TARGETS ── */
+.tgt-row{display:flex;gap:10px;flex-wrap:wrap;padding:10px 0;
+  border-top:1px solid rgba(255,255,255,.06);margin-top:8px}
+.tgt-box{background:var(--s2);border:1px solid var(--bd);border-radius:6px;
+  padding:8px 12px;font-family:var(--mono);font-size:13.5px}
+.tgt-lbl{font-size:11px;color:var(--mu);display:block;margin-bottom:2px;
+  text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+/* ── GAP PREDICTION ── */
+.gap-bar-wrap{background:rgba(255,255,255,.07);border-radius:5px;height:10px;overflow:hidden;flex:1}
+.gap-bar-fill{height:10px;border-radius:5px}
+.gap-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.gap-score{font-family:var(--mono);font-size:30px;font-weight:700;min-width:62px;line-height:1}
+.gap-bias{font-family:var(--mono);font-size:16px;font-weight:700}
+.gap-facts{margin-top:8px}
+.gap-fact{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:13.5px}
+.gap-pts{font-family:var(--mono);font-size:13.5px;font-weight:700;min-width:48px}
+/* ── STOCK SUMMARY ── */
+.verdict-banner{padding:12px 16px;border-radius:8px;font-family:var(--mono);
+  font-size:17px;font-weight:700;margin-bottom:12px;border:1px solid transparent}
+.verdict-buy{background:var(--grd);color:var(--gr);border-color:rgba(37,230,160,.35)}
+.verdict-sell{background:var(--red);color:var(--re);border-color:rgba(255,92,114,.35)}
+.verdict-hold{background:var(--yed);color:var(--ye);border-color:rgba(255,203,61,.3)}
+.reason-list{margin-bottom:12px}
+.reason-item{display:flex;align-items:flex-start;gap:10px;padding:6px 0;font-size:13.5px;
+  border-bottom:1px solid rgba(255,255,255,.055)}
 .reason-item:last-child{border-bottom:none}
-.reason-icon{font-size:12px;flex-shrink:0;margin-top:1px}
-/* CANDLE CHIPS */
-.chip{display:inline-block;background:var(--s2);border:1px solid var(--bd);border-radius:3px;
-  font-family:var(--mono);font-size:9px;padding:2px 5px;margin:2px;color:var(--bl)}
-/* CONFLUENCE */
-.conf-str{font-family:var(--mono);font-size:11px;font-weight:700}
-/* NAV */
-.nav{position:fixed;top:52px;right:16px;background:var(--s1);border:1px solid var(--bd);
-  border-radius:6px;padding:10px;max-height:80vh;overflow-y:auto;font-size:10px;width:140px;
-  z-index:99}
-.nav-title{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--mu);margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--bd)}
-.nav a{display:block;padding:3px 0;color:var(--mu);font-family:var(--mono);font-size:9px}
+.reason-icon{font-size:14px;flex-shrink:0;margin-top:1px}
+/* ── CHIPS ── */
+.chip{display:inline-block;background:var(--s2);border:1px solid var(--bd);border-radius:5px;
+  font-family:var(--mono);font-size:11.5px;padding:3px 8px;margin:2px 4px 2px 0;color:var(--bl)}
+/* ── CONFLUENCE ── */
+.conf-str{font-family:var(--mono);font-size:13.5px;font-weight:700}
+/* ── SIDE NAV ── */
+.nav{position:fixed;top:66px;right:18px;background:rgba(18,23,36,.95);
+  border:1px solid var(--bd);backdrop-filter:blur(8px);
+  border-radius:var(--rad);padding:14px;max-height:80vh;overflow-y:auto;
+  font-size:12px;width:162px;z-index:99;box-shadow:var(--sh)}
+.nav-title{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--mu);margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--bd);font-weight:700}
+.nav a{display:block;padding:4px 0;color:var(--mu);font-family:var(--mono);font-size:12px}
 .nav a:hover,.nav a.bo{color:var(--gr)}.nav a.bd{color:var(--re)}.nav a.sw{color:var(--ye)}
-/* FOOTER */
-.ftr{border-top:1px solid var(--bd);padding:12px 20px;font-family:var(--mono);
-  font-size:9px;color:var(--mu);display:flex;justify-content:space-between}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.g2,.g3{grid-template-columns:1fr}.nav{display:none}.tf-block-body{grid-template-columns:1fr 1fr}}
-@media(max-width:500px){.cards{grid-template-columns:1fr}}
+/* ── FOOTER ── */
+.ftr{border-top:1px solid var(--bd);padding:14px 26px;font-family:var(--mono);
+  font-size:12px;color:var(--mu);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+/* ── RESPONSIVE ── */
+@media(max-width:1560px){.nav{display:none}}
+@media(max-width:1000px){.g2,.g3{grid-template-columns:1fr}.wrap{padding:16px 14px 8px}
+  .hdr{padding:12px 14px}.ftr{padding:12px 14px}}
+@media(max-width:640px){.cards{grid-template-columns:1fr}.card-val{font-size:30px}
+  .det-sym{font-size:18px}.gap-score{font-size:26px}}
+@media print{
+  .nav{display:none}.hdr{position:static;backdrop-filter:none}
+  body{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .card,.sec,.det-card{break-inside:avoid;box-shadow:none}
+}
 </style>
 </head>
 <body>
@@ -5938,12 +5982,12 @@ tr:last-child td{border-bottom:none}
         w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
         w('<td class="mono" style="color:' + rv_col + '">' + str(rv) + '×</td>')
         w('<td class="mono" style="color:' + rr_col + '">' + str(rr) + ':1</td>')
-        w('<td style="font-size:10px;color:' + ema_col + '">' + esc(ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR")) + '</td>')
+        w('<td style="font-size:12px;color:' + ema_col + '">' + esc(ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR")) + '</td>')
         w('<td>' + chips + '</td></tr>')
     w('</tbody></table></div></div>')
 
     # ── PER-SYMBOL DETAIL CARDS ───────────────────────────────
-    w('<h2 style="font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:20px 0 10px">Symbol Detail Cards</h2>')
+    w('<h2 style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--tx);letter-spacing:0;text-transform:none;margin:28px 0 14px">Symbol Detail Cards</h2>')
 
     for sym, e in ranked:
         sec     = SECTOR_MAP.get(sym,"")
@@ -5957,7 +6001,7 @@ tr:last-child td{border-bottom:none}
         w('<div class="det-card" id="sym-' + esc(sym) + '">')
         w('<div class="det-hdr">')
         w('  <div>')
-        w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:13px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
+        w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:15px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
         w('    <div class="det-meta">' + fmt_p(price) + ' &nbsp;·&nbsp; Confluence: <span style="color:' + conf_col + ';font-weight:700">' + conf_str + ' (' + ('+' if conf>=0 else '') + str(conf) + ')</span></div>')
         w('  </div>')
         w('  <div class="tfdots">')
@@ -5986,16 +6030,16 @@ tr:last-child td{border-bottom:none}
             pr  = safe(te.get("price",0))
             cd  = te.get("candle_date","—")
             chg = te.get("signal_changed",False)
-            chg_tag = ' <span style="color:var(--ye);font-size:9px">⚡CHANGED</span>' if chg else ""
+            chg_tag = ' <span style="color:var(--ye);font-size:11px">⚡CHANGED</span>' if chg else ""
             rsi_cls = "rsi-ob" if rsi>70 else ("rsi-bull" if rsi>55 else ("rsi-mid" if rsi>40 else "rsi-os"))
             rv_col = "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")
             w('<tr><td class="mono" style="font-weight:700">' + tf + '</td>')
             w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(str(sig),"--") + '</span>' + chg_tag + '</td>')
-            w('<td><div style="color:' + sc_col + ';font-family:var(--mono);font-size:11px">' + str(cs) + '</div><div class="sbar-bg" style="width:45px;margin-top:2px"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></td>')
+            w('<td><div style="color:' + sc_col + ';font-family:var(--mono);font-size:13px">' + str(cs) + '</div><div class="sbar-bg" style="width:45px;margin-top:2px"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></td>')
             w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
             w('<td class="mono" style="color:' + rv_col + '">' + str(rv) + '×</td>')
             w('<td class="mono">' + fmt_p(pr) + '</td>')
-            w('<td style="font-size:10px;color:var(--mu)">' + esc(cd) + '</td></tr>')
+            w('<td style="font-size:12px;color:var(--mu)">' + esc(cd) + '</td></tr>')
         w('</tbody></table></div>')
 
         # Per-TF detail blocks
@@ -6030,11 +6074,11 @@ tr:last-child td{border-bottom:none}
             sc_col  = "var(--gr)" if cs>=65 else ("var(--ye)" if cs>=40 else "var(--re)")
 
             w('<div class="tf-block"><div class="tf-block-hdr">')
-            w('<span style="color:var(--mu);font-size:9px;font-weight:400">──</span>')
+            w('<span style="color:var(--mu);font-size:11px;font-weight:400">──</span>')
             w('<span style="color:var(--ye)">' + tf + '</span>')
             w('<span class="badge ' + sc(sig) + '">' + esc(str(sig)) + '</span>')
-            w('<span style="color:' + sc_col + ';font-size:11px">' + str(cs) + '/100</span>')
-            w('<span style="color:var(--mu);font-size:10px;font-weight:400;margin-left:auto">R:R <span style="color:' + ("var(--gr)" if rr>=1 else "var(--ye)") + '">' + str(rr) + ':1</span></span>')
+            w('<span style="color:' + sc_col + ';font-size:13px">' + str(cs) + '/100</span>')
+            w('<span style="color:var(--mu);font-size:12px;font-weight:400;margin-left:auto">R:R <span style="color:' + ("var(--gr)" if rr>=1 else "var(--ye)") + '">' + str(rr) + ':1</span></span>')
             w('</div>')
             if reason:
                 w('<div class="reason" style="padding:4px 12px">' + esc(reason.replace("|"," · ")) + '</div>')
@@ -6055,8 +6099,8 @@ tr:last-child td{border-bottom:none}
             # S/R + targets
             if supp or res or tgt:
                 w('<div style="padding:8px 12px;border-top:1px solid var(--bd)">')
-                if supp: w('<div style="font-size:11px;margin-bottom:4px">Support: ' + '&nbsp;'.join('<span class="mono gr">₹'+esc(str(s))+'</span>' for s in supp) + '</div>')
-                if res:  w('<div style="font-size:11px;margin-bottom:4px">Resistance: ' + '&nbsp;'.join('<span class="mono re">₹'+esc(str(r))+'</span>' for r in res) + '</div>')
+                if supp: w('<div style="font-size:13px;margin-bottom:4px">Support: ' + '&nbsp;'.join('<span class="mono gr">₹'+esc(str(s))+'</span>' for s in supp) + '</div>')
+                if res:  w('<div style="font-size:13px;margin-bottom:4px">Resistance: ' + '&nbsp;'.join('<span class="mono re">₹'+esc(str(r))+'</span>' for r in res) + '</div>')
                 if tgt:
                     t1 = tgt.get("target1",""); t2 = tgt.get("target2",""); sl = tgt.get("stop","")
                     w('<div class="tgt-row">')
@@ -6072,12 +6116,12 @@ tr:last-child td{border-bottom:none}
             if cps:
                 bull_cp = [p for p in cps if p in CANDLE_BULL]
                 bear_cp = [p for p in cps if p in CANDLE_BEAR]
-                if bull_cp: extras.append('<span style="color:var(--gr);font-size:10px">Candle ↑</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bull_cp))
-                if bear_cp: extras.append('<span style="color:var(--re);font-size:10px">Candle ↓</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bear_cp))
+                if bull_cp: extras.append('<span style="color:var(--gr);font-size:12px">Candle ↑</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bull_cp))
+                if bear_cp: extras.append('<span style="color:var(--re);font-size:12px">Candle ↓</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bear_cp))
             if fib:
                 sw_h = fib.get("sw_high",""); sw_l = fib.get("sw_low","")
                 f382 = fib.get("fib_38.2",""); f500 = fib.get("fib_50",""); f618 = fib.get("fib_61.8","")
-                fib_line = '<span style="font-size:10px;color:var(--mu)">Fib:</span>'
+                fib_line = '<span style="font-size:12px;color:var(--mu)">Fib:</span>'
                 for lbl,lvl in [("38.2%",f382),("50%",f500),("61.8%",f618)]:
                     if lvl:
                         # Bug fix: raw float(lvl) raised ValueError on a junk
@@ -6089,20 +6133,20 @@ tr:last-child td{border-bottom:none}
             if w52:
                 ph = safe(w52.get("pct_from_high",0)); pl = safe(w52.get("pct_from_low",0))
                 ph_col = "var(--gr)" if ph>=-5 else ("var(--ye)" if ph>=-15 else "var(--re)")
-                extras.append('<span style="font-size:10px;color:var(--mu)">52W:</span> <span class="mono" style="color:' + ph_col + '">High ₹' + esc(str(w52.get("high_52w",""))) + ' (' + str(ph) + '%)</span> <span class="mono mu">Low ₹' + esc(str(w52.get("low_52w",""))) + ' (+' + str(pl) + '%)</span>')
+                extras.append('<span style="font-size:12px;color:var(--mu)">52W:</span> <span class="mono" style="color:' + ph_col + '">High ₹' + esc(str(w52.get("high_52w",""))) + ' (' + str(ph) + '%)</span> <span class="mono mu">Low ₹' + esc(str(w52.get("low_52w",""))) + ' (+' + str(pl) + '%)</span>')
             div_items = []
             if div_.get("regular_bull"): div_items.append('<span style="color:var(--gr)">Reg.Bull▲</span>')
             if div_.get("hidden_bull"):  div_items.append('<span style="color:var(--gr)">Hid.Bull▲</span>')
             if div_.get("regular_bear"): div_items.append('<span style="color:var(--re)">Reg.Bear▼</span>')
             if div_.get("hidden_bear"):  div_items.append('<span style="color:var(--re)">Hid.Bear▼</span>')
-            if div_items: extras.append('<span style="font-size:10px;color:var(--mu)">RSI Div:</span> ' + " ".join(div_items))
+            if div_items: extras.append('<span style="font-size:12px;color:var(--mu)">RSI Div:</span> ' + " ".join(div_items))
             if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT R1=₹' + esc(str(te.get("retest_bo_level",""))) + '</span>')
             if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN S1=₹' + esc(str(te.get("retest_bd_level",""))) + '</span>')
 
             if extras:
                 w('<div style="padding:6px 12px;border-top:1px solid var(--bd);display:flex;flex-wrap:wrap;gap:10px">')
                 for ex in extras:
-                    w('<div style="font-size:11px">' + ex + '</div>')
+                    w('<div style="font-size:13px">' + ex + '</div>')
                 w('</div>')
             w('</div>')  # tf-block
 
