@@ -69,12 +69,14 @@ def cprint(text, color="", bold=False):
     print(prefix + text + C.RESET)
 
 def signal_color(sig):
+    # str(): a corrupt row can hold an unhashable signal (dict/list) — a raw
+    # dict.get(list) raises TypeError: unhashable type.
     return {
         "BREAKOUT":  C.GREEN,
         "BREAKDOWN": C.RED,
         "SIDEWAYS":  C.YELLOW,
         "NONE":      C.DIM,
-    }.get(sig, "")
+    }.get(str(sig), "")
 
 # ─────────────────────────────────────────────────────────────
 #  ANSI-AWARE COLUMN ALIGNMENT HELPERS
@@ -774,7 +776,8 @@ def fetch_historical(instrument_key, unit, value, lookback_days, headers, verbos
     Bug 1 — to_date on weekend (critical for minutes/hours):
       Old code: yesterday = date.today() - 1 day (raw).
       On Mondays that produces Sunday → Upstox returns HTTP 400 / empty for
-      minute-level data.  Fixed: to_date = _last_trading_day(today - 1),
+      minute-level data (Upstox caps minutes ranges at 30 calendar days —
+      see _HIST_MAX_DAYS).  Fixed: to_date = _last_trading_day(today - 1),
       i.e. Friday when today is Monday.
 
     Bug 2 — from_date on weekend:
@@ -783,9 +786,9 @@ def fetch_historical(instrument_key, unit, value, lookback_days, headers, verbos
       so the API range always starts on a valid trading session.
 
     Bug 3 — no chunking for long intraday lookbacks:
-      Upstox caps minute historical calls at 15 calendar days each, hours at 90 days.
+      Upstox caps minute historical calls at 30 calendar days each, hours at 90 days.
       When lookback_days exceeds _HIST_MAX_DAYS[unit] the function splits the range
-      into max_span-day chunks (15 for minutes, 90 for hours), fetches each chunk
+      into max_span-day chunks (30 for minutes, 90 for hours), fetches each chunk
       separately, and concatenates the results.
     """
     to_d_obj   = _last_trading_day(_today_ist() - timedelta(days=1))
@@ -821,7 +824,17 @@ def fetch_intraday_v3(instrument_key, v3_unit, v3_interval, headers, verbose=Tru
                 candles = as_list(as_dict(r.json().get("data")).get("candles"))
                 if candles:
                     return _parse_candle_df(candles)
-                if verbose: print("    No intraday candles returned (market closed?).")
+                if verbose:
+                    # Don't blame "market closed?" when the clock says
+                    # otherwise — a 200-with-no-candles during market hours
+                    # (feed empty/lagging) misleads the user at e.g. 10:00 AM.
+                    if is_market_open():
+                        print("    \u26a0 No intraday candles returned although the market is "
+                              "OPEN \u2014 Upstox's intraday feed is empty right now; "
+                              "today's session bars are missing from this TF "
+                              "(retry after data settles).")
+                    else:
+                        print("    No intraday candles returned (market closed?).")
                 return pd.DataFrame()
             if r.status_code in (401, 403):
                 raise TokenError(
@@ -870,6 +883,17 @@ CACHE_TF_MAP = {
     "WEEK":  "DAY",
     "MONTH": "DAY",
 }
+
+
+def _merge_candles(*dfs):
+    """Concatenate candle frames, deduping on ts and sorting oldest-first."""
+    parts = [d for d in dfs if d is not None and not d.empty]
+    if not parts:
+        return pd.DataFrame()
+    if len(parts) == 1:
+        return parts[0].reset_index(drop=True)
+    return (pd.concat(parts, ignore_index=True)
+            .drop_duplicates("ts").sort_values("ts").reset_index(drop=True))
 
 
 def _cache_load(instrument_key, cache_tf):
@@ -1161,7 +1185,12 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
                                                   headers, verbose)
                     if not new_df.empty:
                         _cache_save(instrument_key, cache_tf, new_df)
-                        cached_df = _cache_load(instrument_key, cache_tf)
+                        reloaded = _cache_load(instrument_key, cache_tf)
+                        # If the reload comes back empty (DB write/read broke
+                        # mid-scan), keep the repair we just downloaded instead
+                        # of discarding it and reporting no data at all.
+                        cached_df = (reloaded if not reloaded.empty
+                                     else _merge_candles(cached_df, new_df))
             elif verbose:
                 print("    " + C.DIM + "CACHE GAP [" + cache_tf + "] "
                       "still incomplete — one repair attempt per run" + C.RESET)
@@ -1196,7 +1225,16 @@ def fetch_historical_cached(instrument_key, unit, value, lookback_days, headers,
             if not new_df.empty:
                 _cache_save(instrument_key, cache_tf, new_df)
                 # Reload so we have the full merged dataset from DB
-                cached_df = _cache_load(instrument_key, cache_tf)
+                reloaded = _cache_load(instrument_key, cache_tf)
+                if not reloaded.empty:
+                    cached_df = reloaded
+                else:
+                    # Reload failed after a successful download — using it
+                    # would throw away everything we just fetched (observed
+                    # live: full 2500d DAY history downloaded, then "1 WEEK
+                    # candle" resampled from the lone live bar).  Fall back
+                    # to old-in-memory ∪ fresh-download.
+                    cached_df = _merge_candles(cached_df, new_df)
         else:
             if verbose:
                 print("    " + C.DIM + "CACHE [" + cache_tf
@@ -1615,21 +1653,27 @@ def calc_support_resistance(df, lookback=30):
     highs        = recent["high"]
     lows         = recent["low"]
 
-    # Swing highs above current price only → resistance
+    # Swing highs above current price only → resistance.
+    # Bug fix: the top-3 slice kept the three FARTHEST swings (descending
+    # order), so whenever more than 3 swing highs existed the NEAREST one —
+    # the very level get_price_targets uses for T1 — was dropped from the
+    # displayed list. Keep the three closest-to-price levels instead.
     resistance = sorted(set(
         round(h, 2) for i, h in enumerate(highs)
         if i > 0 and i < len(highs)-1
         and h == highs.iloc[max(0,i-2):i+3].max()
         and h > current_price           # must be above price to be resistance
-    ), reverse=True)[:3]
+    ))[:3]
 
-    # Swing lows below current price only → support
+    # Swing lows below current price only → support (nearest three first —
+    # same fix: an ascending slice used to keep the three farthest and drop
+    # the nearest level, which is the one shown as the SL in trade plans).
     support = sorted(set(
         round(l, 2) for i, l in enumerate(lows)
         if i > 0 and i < len(lows)-1
         and l == lows.iloc[max(0,i-2):i+3].min()
         and l < current_price           # must be below price to be support
-    ))[:3]
+    ), reverse=True)[:3]
 
     return support, resistance
 
@@ -2740,33 +2784,50 @@ def get_price_targets(df, signal, tf="DAY"):
     min_sl_dist = min_sl_atr * atr   # minimum stop distance — rejects micro-levels
     max_t_dist  = max_t_atr  * atr   # absolute price distance cap for targets
 
-    # Swing highs above price AND within target cap → resistance / BO targets
-    res_levels = sorted(set(
+    # Swing highs above price AND far enough to be meaningful (micro-level
+    # floor).  Bug fix: no minimum distance meant a swing high ₹0.9 above a
+    # ₹1200 DAY close could be used as a level.  min_sl_dist rejects
+    # micro-levels that are closer than min_sl_atr×ATR; the ATR fallback then
+    # fires.  The per-use distance caps (target vs stop) are applied below —
+    # NOT baked in here, because each side serves both roles: a resistance is
+    # a BREAKOUT target but a BREAKDOWN stop, and vice-versa for supports.
+    res_above = sorted(set(
         round(float(h), 2) for i, h in enumerate(highs)
         if i > 0 and i < len(highs) - 1
         and h == highs.iloc[max(0, i-2):i+3].max()
         and float(h) > close
-        and float(h) - close <= max_t_dist          # ← target cap
         and float(h) - close >= min_sl_dist          # ← min distance (same floor for symmetry)
     ))
 
-    # Swing lows below price AND within SL cap AND far enough to be meaningful.
-    # Bug fix: no minimum distance meant a swing low ₹0.9 below a ₹1200 DAY close
-    # (ATR=₹24.86) was used as stop, producing 28.2:1 R:R. min_sl_dist rejects
-    # micro-supports that are closer than min_sl_atr×ATR; the ATR fallback then fires.
-    sup_levels = sorted(set(
+    sup_below = sorted(set(
         round(float(l), 2) for i, l in enumerate(lows)
         if i > 0 and i < len(lows) - 1
         and l == lows.iloc[max(0, i-2):i+3].min()
         and float(l) < close
-        and close - float(l) <= max_sl_dist         # ← SL cap
-        and close - float(l) >= min_sl_dist         # ← SL floor: reject micro-supports
-    ), reverse=True)
+        and close - float(l) >= min_sl_dist          # ← floor: reject micro-supports
+    ), reverse=True)   # nearest first
+
+    # Per-use caps, exactly as documented above:
+    #   targets may sit up to max_t_atr × ATR away — beyond that the
+    #     ATR-multiple fallback is used (a swing the price already left far
+    #     behind is not an actionable target);
+    #   stops may sit up to max_sl_atr × ATR away — beyond that the stop is
+    #     too far to be practical and the ATR fallback is used.
+    # Bug fix: the caps used to be applied per SIDE (support→SL cap,
+    # resistance→target cap), which is only correct for a BREAKOUT.  On a
+    # BREAKDOWN the roles swap — stops are resistances and targets are
+    # supports — so short trades silently got 8×ATR stops (DAY) that the
+    # docstring promises to cap at 4×ATR, while their targets were cut off at
+    # 4×ATR instead of 8×ATR.
+    res_tgt = [h for h in res_above if h - close <= max_t_dist]  # BO targets
+    sup_tgt = [l for l in sup_below if close - l <= max_t_dist]  # BD targets
+    sup_sl  = [l for l in sup_below if close - l <= max_sl_dist]  # BO stop
+    res_sl  = [h for h in res_above if h - close <= max_sl_dist]  # BD stop
 
     if signal == "BREAKOUT":
-        t1 = res_levels[0] if res_levels          else round(close + 1.5 * atr, 2)
-        t2 = res_levels[1] if len(res_levels) > 1 else round(close + 3.0 * atr, 2)
-        sl = sup_levels[0] if sup_levels           else round(close - 1.0 * atr, 2)
+        t1 = res_tgt[0] if res_tgt           else round(close + 1.5 * atr, 2)
+        t2 = res_tgt[1] if len(res_tgt) > 1  else round(close + 3.0 * atr, 2)
+        sl = sup_sl[0]  if sup_sl            else round(close - 1.0 * atr, 2)
         # Bug fix: the T2 fallback is a fixed 3×ATR measured from `close`,
         # but T1 is the nearest qualifying swing level — which the caps allow
         # to sit anywhere up to max_t_atr (8×ATR on DAY) away. When exactly
@@ -2786,9 +2847,9 @@ def get_price_targets(df, signal, tf="DAY"):
                 "stop":    _floor_price(sl, close)}
 
     elif signal == "BREAKDOWN":
-        t1 = sup_levels[0] if sup_levels           else round(close - 1.5 * atr, 2)
-        t2 = sup_levels[1] if len(sup_levels) > 1  else round(close - 3.0 * atr, 2)
-        sl = res_levels[0] if res_levels           else round(close + 1.0 * atr, 2)
+        t1 = sup_tgt[0] if sup_tgt           else round(close - 1.5 * atr, 2)
+        t2 = sup_tgt[1] if len(sup_tgt) > 1  else round(close - 3.0 * atr, 2)
+        sl = res_sl[0]  if res_sl            else round(close + 1.0 * atr, 2)
         # Mirror of the fix above: on a short, T2 must sit BELOW T1 by a
         # meaningful margin. A support 3.5×ATR down (inside the 4×ATR SL cap)
         # produced "T1 ₹930 / T2 ₹940" — cover the second half at a worse
@@ -2879,6 +2940,9 @@ def trend_strength(components):
 _SCHEMAS_READY = set()   # DB_FILEs whose DDL has already been applied
 
 
+_SCHEMA_WARNED = set()   # DB_FILEs that already got the loud DDL banner
+
+
 def _db_connect():
     """Return a connection to the SQLite database, creating tables if needed.
 
@@ -2888,7 +2952,41 @@ def _db_connect():
     con = sqlite3.connect(DB_FILE)
     con.execute("PRAGMA journal_mode=WAL")
     if DB_FILE in _SCHEMAS_READY:
-        return con
+        # The file behind this path can change WHILE we run: deleted and
+        # recreated empty, replaced by a backup restore, truncated by a
+        # crash.  The memo only records that DDL once succeeded for the
+        # path — verify the schema is actually still there, or every later
+        # query dies with "no such table" for the rest of the process's
+        # life while the memo keeps saying "ready".
+        if con.execute("SELECT 1 FROM sqlite_master "
+                       "WHERE type='table' AND name='scan_data'").fetchone():
+            return con
+        _SCHEMAS_READY.discard(DB_FILE)   # vanished → rebuild below
+    try:
+        _apply_schema(con)
+    except Exception as ex:
+        # One loud root-cause banner instead of a silent lifetime of
+        # per-operation "no such table" errors; the per-op errors still
+        # follow, but now the user is told WHY and what to do.
+        if DB_FILE not in _SCHEMA_WARNED:
+            _SCHEMA_WARNED.add(DB_FILE)
+            cprint("\n  ✖ DB SCHEMA ERROR: cannot create tables in "
+                   + DB_FILE + " (" + str(ex) + ")", C.RED, bold=True)
+            cprint("     The file is unreadable or corrupt — restore it from a "
+                   "backup or delete it, then restart.", C.RED)
+            cprint("     Scans will NOT be saved until this is fixed.", C.RED)
+        try:
+            con.close()
+        except Exception:
+            pass
+        raise
+    _SCHEMAS_READY.add(DB_FILE)
+    return con
+
+
+def _apply_schema(con):
+    """Idempotent DDL for one connection — run when a path's schema is new
+    or has vanished (file replaced under a running process)."""
     con.execute("""
         CREATE TABLE IF NOT EXISTS scan_data (
             symbol  TEXT NOT NULL,
@@ -2943,8 +3041,6 @@ def _db_connect():
             PRIMARY KEY (instrument_key, tf)
         )""")
     con.commit()
-    _SCHEMAS_READY.add(DB_FILE)
-    return con
 
 
 _corrupt = [0]      # rows that failed to decode during the last load_data()
@@ -2977,7 +3073,13 @@ def load_data():
 
 
 def save_data(data):
-    """Upsert all (symbol, tf) entries from data dict into scan_data table."""
+    """Upsert all (symbol, tf) entries from data dict into scan_data table.
+
+    Returns True on success, False if the write failed.  Callers that print
+    a success message MUST check the result: swallowing the failure here
+    while announcing "✓ Done. Saved" unconditionally made a scan whose
+    writes all died with "no such table: scan_data" claim it had persisted.
+    """
     try:
         con = _db_connect()
         rows = []
@@ -2990,8 +3092,10 @@ def save_data(data):
             rows)
         con.commit()
         con.close()
+        return True
     except Exception as ex:
         cprint("  DB save_data error: " + str(ex), C.RED)
+        return False
 
 
 def load_history(limit_per_key=None):
@@ -3198,7 +3302,9 @@ SIGNAL_BIAS = {"BREAKOUT": 1, "BREAKDOWN": -1, "SIDEWAYS": 0, "NONE": 0}
 
 def confluence_score(sym_data, tfs=None):
     tfs = tfs or TIMEFRAMES_SWING
-    return sum(SIGNAL_BIAS.get(as_dict(sym_data.get(tf)).get("signal", "NONE"), 0) for tf in tfs if tf in sym_data)
+    # str(): unhashable junk signal (dict/list) must not raise in dict.get
+    return sum(SIGNAL_BIAS.get(str(as_dict(sym_data.get(tf)).get("signal", "NONE")), 0)
+               for tf in tfs if tf in sym_data)
 
 def confluence_label(score):
     # Bug fix: was a dict lookup that silently returned "NEUTRAL [0]" for any |score| > 3.
@@ -3214,11 +3320,12 @@ def confluence_label(score):
 
 def conflict_status(sym_data, tfs=None):
     tfs    = tfs or TIMEFRAMES_SWING
-    active = [as_dict(sym_data[tf]).get("signal", "NONE") for tf in tfs
+    # str(): an unhashable junk signal (dict/list) would raise in set() below
+    active = [str(as_dict(sym_data[tf]).get("signal", "NONE")) for tf in tfs
               if tf in sym_data]
     active = [sig for sig in active if sig != "NONE"]
     if not active:              return C.DIM    + "NO SIGNAL"  + C.RESET
-    if len(set(active)) == 1:  return C.GREEN  + "ALIGNED  → " + active[0] + C.RESET
+    if len(set(active)) == 1:  return C.GREEN  + "ALIGNED  → " + str(active[0]) + C.RESET
     return                             C.YELLOW + "CONFLICT → mixed signals" + C.RESET
 
 def ema_alignment_label(c):
@@ -3240,7 +3347,8 @@ def gather_alerts(sym, sym_data, tfs=None):
     # Coerce everything: sym_data[tf] is whatever was in the DB blob, and a
     # stale or hand-edited row can hold a non-dict. `sym_data[tf]["signal"]`
     # raised TypeError/KeyError and took the whole alert screen down.
-    active = [as_dict(sym_data[tf]).get("signal", "NONE") for tf in tfs
+    # str(): an unhashable junk signal (dict/list) would raise in set() below.
+    active = [str(as_dict(sym_data[tf]).get("signal", "NONE")) for tf in tfs
               if tf in sym_data]
     active = [sig for sig in active if sig != "NONE"]
 
@@ -3249,12 +3357,23 @@ def gather_alerts(sym, sym_data, tfs=None):
         alerts.append((sym, "CONFLICT",       "Mixed signals across TFs"))
 
     # Confluence
+    # Bug fix: detail text claimed "All N TFs BREAKOUT" whenever |score| >= 3 —
+    # with 6 active TFs, half BREAKOUT + half NONE scored 3 and still read
+    # "All 6".  Count the actual votes and only say "All" on unanimous ones.
     score = confluence_score(sym_data, tfs)
-    n_all = str(len([tf for tf in tfs if tf in sym_data]))
-    if score >= 3:  alerts.append((sym, C.GREEN + "STRONG BULL" + C.RESET,
-                                   "All " + n_all + " TFs BREAKOUT"))
-    if score <= -3: alerts.append((sym, C.RED   + "STRONG BEAR" + C.RESET,
-                                   "All " + n_all + " TFs BREAKDOWN"))
+    sigs_all = [as_dict(sym_data[tf]).get("signal", "NONE") for tf in tfs
+                if tf in sym_data]
+    n_all = len(sigs_all)
+    bo_n  = sigs_all.count("BREAKOUT")
+    bd_n  = sigs_all.count("BREAKDOWN")
+    if score >= 3:
+        detail = ("All " + str(n_all) + " TFs BREAKOUT" if bo_n == n_all
+                  else str(bo_n) + "/" + str(n_all) + " TFs BREAKOUT (strong confluence)")
+        alerts.append((sym, C.GREEN + "STRONG BULL" + C.RESET, detail))
+    if score <= -3:
+        detail = ("All " + str(n_all) + " TFs BREAKDOWN" if bd_n == n_all
+                  else str(bd_n) + "/" + str(n_all) + " TFs BREAKDOWN (strong confluence)")
+        alerts.append((sym, C.RED   + "STRONG BEAR" + C.RESET, detail))
 
     for tf in tfs:
         if tf not in sym_data:
@@ -3329,7 +3448,7 @@ def trend_bar(strength, width=10):
 
 def sig_str(sig):
     col = signal_color(sig)
-    short = SIGNAL_SHORT.get(sig, "--")
+    short = SIGNAL_SHORT.get(str(sig), "--")   # str(): unhashable junk signal
     return col + C.BOLD + short + C.RESET
 
 
@@ -3375,6 +3494,50 @@ def header(title="MASTER SCANNER v8.0 PRO"):
 #  All scan paths (auto_scan, scan_single_symbol) funnel here.
 # ─────────────────────────────────────────────────────────────
 
+def _stale_intraday_warnings(sym, data, use_tfs):
+    """Flag intraday TF rows whose data lags the DAY row of the same scan.
+
+    When the market is shut, every TF must describe the SAME last session:
+    the minutes/hours history, the daily history and the (empty) live merge
+    all end at the same close — empirically identical to the paisa when the
+    data is complete.  Upstox can publish the minutes/hours candles of the
+    latest session later than the daily ones; the scanner then shows
+    5MIN/1HR closes that quietly disagree with DAY and nothing else reports
+    it.  Two checks, both market-closed only and only when DAY was scanned
+    in this pass:
+      * intraday candle_date's day-part older than DAY's  → stale
+      * intraday close off DAY's close by more than 0.2% → stale
+    WEEK/MONTH are excluded: they are resampled from DAY itself.
+
+    Returns a list of human-readable warning strings (empty = looks fine).
+    """
+    if is_market_open() or "DAY" not in use_tfs:
+        return []
+    day = as_dict(as_dict(data.get(sym)).get("DAY"))
+    day_date = str(day.get("candle_date") or "")[:10]
+    day_px   = safe_float(day.get("price"), 0)
+    if not day_date or day_px <= 0:
+        return []
+    warns = []
+    for tf in use_tfs:
+        if tf not in TF_INTRADAY_V3 or tf == "DAY" or tf in RESAMPLE_TFS:
+            continue
+        e  = as_dict(as_dict(data.get(sym)).get(tf))
+        cd = str(e.get("candle_date") or "")
+        tf_date = cd[:10]
+        tf_px   = safe_float(e.get("price"), 0)
+        if tf_date and tf_date < day_date:
+            warns.append(tf + " history ends " + tf_date + " but DAY is "
+                         + day_date + " — intraday data is stale; re-scan later.")
+        elif tf_px > 0 and abs(tf_px - day_px) / day_px > 0.002:
+            off = abs(tf_px - day_px) / day_px * 100
+            warns.append(tf + " close ₹" + str(round(tf_px, 2)) + " vs DAY ₹"
+                         + str(round(day_px, 2)) + " (" + str(round(off, 2))
+                         + "% off) — intraday history may be incomplete; "
+                         "re-scan later.")
+    return warns
+
+
 def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
     """
     Download candles, compute indicators, detect signals, and store
@@ -3394,9 +3557,12 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
             continue
 
         unit, value, lookback = TF_CONFIG[tf]
+        # The unit strings in TF_CONFIG are fixed plurals ("hours", "days"),
+        # which printed "1HR (1 hours, 90d lookback)" / "DAY (1 days, ...)".
+        unit_lbl = unit[:-1] if value == "1" and unit.endswith("s") else unit
         resample_tag = (" (daily→" + RESAMPLE_TFS[tf] + ")"
                         if tf in RESAMPLE_TFS else
-                        " (" + value + " " + unit + ", " + str(lookback) + "d lookback)")
+                        " (" + value + " " + unit_lbl + ", " + str(lookback) + "d lookback)")
         print("    " + C.YELLOW + tf + C.RESET + resample_tag)
 
         df = fetch_candles(inst_key, unit, value, lookback, hdrs, verbose=True, tf_name=tf)
@@ -3583,6 +3749,13 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
     # so conf_raw=1 instead of 6. Now all TFs are in data[sym] — recompute
     # with the full picture. Also log_history here so it records the FINAL
     # accurate score, not the intermediate one from inside the loop.
+    # Surface intraday history that silently lags the daily bar: the
+    # Upstox minutes/hours endpoints have been observed to publish the
+    # latest session later than the daily one, so 5MIN/1HR closes then
+    # disagree with DAY (e.g. ₹1205.7 vs ₹1220.0) with no error shown.
+    for _msg in _stale_intraday_warnings(sym, data, use_tfs):
+        cprint("    ⚠ " + _msg, C.YELLOW)
+
     for tf in use_tfs:
         if tf not in data[sym]:
             continue
@@ -3637,17 +3810,24 @@ def auto_scan(data, selected_tfs=None):
         # continuing only burns the rate budget and buries the real cause.
         cprint("\n  ✗ SCAN ABORTED: " + str(exc), C.RED, bold=True)
         cprint("  No further symbols were scanned.", C.RED)
-        save_data(data)
+        if not save_data(data):
+            cprint("  ✗ Partial save FAILED — nothing was written to "
+                   + DATA_FILE, C.RED, bold=True)
         input("  Press ENTER to continue...")
         return data
     except KeyboardInterrupt:
         cprint("\n  Scan interrupted — saving what we have…", C.YELLOW)
-        save_data(data)
+        if not save_data(data):
+            cprint("  ✗ Partial save FAILED — nothing was written to "
+                   + DATA_FILE, C.RED, bold=True)
         input("  Press ENTER to continue...")
         return data
 
-    save_data(data)
-    cprint("  ✓ Scan complete. Saved to " + DATA_FILE, C.GREEN)
+    if save_data(data):
+        cprint("  ✓ Scan complete. Saved to " + DATA_FILE, C.GREEN)
+    else:
+        cprint("  ✗ SAVE FAILED — results were NOT written to " + DATA_FILE,
+               C.RED, bold=True)
     input("  Press ENTER to continue...")
     return data
 
@@ -3717,8 +3897,11 @@ def scan_single_symbol(data, selected_tfs=None):
         input("  Press ENTER to continue...")
         return data
 
-    save_data(data)
-    cprint("  ✓ Done. Saved to " + DATA_FILE, C.GREEN)
+    if save_data(data):
+        cprint("  ✓ Done. Saved to " + DATA_FILE, C.GREEN)
+    else:
+        cprint("  ✗ SAVE FAILED — results were NOT written to " + DATA_FILE,
+               C.RED, bold=True)
 
     # ── Auto-show full detail immediately ─────────────────────
     see = input("\n  Show full detail for " + sym + "? [Y/n]: ").strip().upper()
@@ -3740,15 +3923,25 @@ def _score_tf_key(entry, tfs):
     Bug fix: previously returned "DAY" if "DAY" in entry, but "DAY" can
     exist as a key with an empty/zero entry (e.g. symbol scanned on WEEK+MONTH
     only). This caused best_setups_view, candle_pattern_view, heatmap_view etc.
-    to get {} back from entry.get(tf_key, {}) and display zeros for all metrics.
+    to display zeros for all metrics.
 
-    Priority: DAY → WEEK → MONTH → 1HR → 15MIN → 5MIN → first key in tfs.
+    The fallback prefers keys whose value is actually a dict so a corrupt
+    scalar row (JSON blob decoded to 42/"oops"/None) is only picked as a last
+    resort — every caller still runs the result through as_dict().
+
+    Priority: DAY → WEEK → MONTH → 1HR → 15MIN → 5MIN → first dict-valued
+    key in tfs → first key in tfs.
     """
     preferred = ["DAY", "WEEK", "MONTH", "1HR", "15MIN", "5MIN"]
     for tf in preferred:
         if tf in entry and safe_float(as_dict(entry[tf]).get("price", 0)):
             return tf
-    # Fallback: first tf in tfs that exists in entry (even if price=0)
+    # Fallback: first tf in tfs that exists in entry AND holds a dict
+    for tf in tfs:
+        if tf in entry and isinstance(entry[tf], dict):
+            return tf
+    # Last resort: any present key (may be a corrupt scalar — callers must
+    # coerce with as_dict) or the first active tf
     for tf in tfs:
         if tf in entry:
             return tf
@@ -3812,8 +4005,12 @@ def dashboard(data, tfs=None):
     div()
 
     # Sort by composite score descending
+    # Bug fix: the picked TF's value comes straight from a JSON blob and can be
+    # a scalar (42 / None / "oops"). `.get(..., {})` only guards a MISSING key,
+    # so a corrupt row raised AttributeError here and killed the dashboard.
     ranked = sorted(data.items(),
-                    key=lambda x: x[1].get(_score_tf_key(x[1], tfs), {}).get("composite_score", 0),
+                    key=lambda x: safe_float(as_dict(x[1].get(_score_tf_key(x[1], tfs)))
+                                             .get("composite_score", 0)),
                     reverse=True)
 
     for sym, entry in ranked:
@@ -3918,13 +4115,13 @@ def view_detail(sym, data):
         p   = safe_float(e.get("price", price))
         print("  " +
               C.BOLD + _ljust(tf, 6) + C.RESET + "  " +
-              col + C.BOLD + _ljust(SIGNAL_LABEL.get(sig,"—"), 16) + C.RESET +
+              col + C.BOLD + _ljust(SIGNAL_LABEL.get(str(sig),"—"), 16) + C.RESET +
               chg +
               "  Score:" + sc_col + str(cs) + C.RESET +
               "  RSI:" + str(rsi) +
               "  RVol:" + str(rv) +
               "  ₹" + str(p) +
-              C.DIM + "  [" + e.get("candle_date","—") + "]" + C.RESET)
+              C.DIM + "  [" + str(e.get("candle_date") or "—") + "]" + C.RESET)
     div("─")
     print("  Confluence : " + str(conf) + "  " + conf_lbl +
           "    Status: " + conflict_status(sym_data, conf_tfs))
@@ -3945,8 +4142,14 @@ def view_detail(sym, data):
     print("  Score  : " + gb_col + C.BOLD + str(gap_score) + "%" + C.RESET +
           "  " + bar_str +
           "  " + gb_col + C.BOLD + gb_str + C.RESET)
-    # Top 3 factors
-    sorted_facts = sorted(gap_facts, key=lambda x: abs(x[1]), reverse=True)[:3]
+    # Every non-zero factor, largest impact first. Bug fix: this used to be
+    # "Top 3 factors", but the score is computed from ALL of them — the
+    # printed points summed to a different raw value than the one actually
+    # scored (e.g. 18 vs 24 → listed factors implied 61% while the header
+    # showed 65%), making correct arithmetic look wrong.
+    sorted_facts = sorted(
+        (f for f in gap_facts if safe_float(f[1]) != 0),
+        key=lambda x: abs(safe_float(x[1])), reverse=True)
     for lbl, pts in sorted_facts:
         col = C.GREEN if pts > 0 else (C.RED if pts < 0 else C.DIM)
         print("  " + col + ("+" if pts >= 0 else "") + str(pts) + "pts" + C.RESET +
@@ -3956,18 +4159,20 @@ def view_detail(sym, data):
 
     # ══ 3. TODAY'S GAP (DAY only) ════════════════════════════════
     gap_d = as_dict(day_e.get("gap"))
-    if gap_d and gap_d.get("gap_type","") != "NO_GAP":
+    # Bug fix: previously any dict without gap_type (or with a junk gap_pct)
+    # still entered this block and KeyError/ValueError'd on the format below.
+    if gap_d.get("gap_type") in ("GAP_UP", "GAP_DOWN"):
         gt  = gap_d["gap_type"]
         gc  = C.GREEN if gt == "GAP_UP" else C.RED
         cprint("  TODAY'S GAP", C.WHITE, bold=True)
         div("─")
         filled_str = C.YELLOW + "FILLED" + C.RESET if gap_d.get("gap_filled") else gc + "OPEN" + C.RESET
         print("  Type   : " + gc + C.BOLD + gt + C.RESET +
-              "  " + "{:+.2f}%".format(gap_d["gap_pct"]) +
-              "  ₹" + str(gap_d["gap_rs"]) +
+              "  " + "{:+.2f}%".format(safe_float(gap_d.get("gap_pct"))) +
+              "  ₹" + str(gap_d.get("gap_rs", "—")) +
               "  Status: " + filled_str)
-        print("  Prev Close : ₹" + str(gap_d["prev_close"]) +
-              "  Today Open : ₹" + str(gap_d["today_open"]))
+        print("  Prev Close : ₹" + str(gap_d.get("prev_close", "—")) +
+              "  Today Open : ₹" + str(gap_d.get("today_open", "—")))
         div("═")
         print()
 
@@ -3980,8 +4185,8 @@ def view_detail(sym, data):
         col = signal_color(sig)
 
         print(col + C.BOLD + "  ┌── " + tf + " " + "─" * (W - 8 - len(tf)) + C.RESET)
-        print("  │  Signal      : " + col + C.BOLD + SIGNAL_LABEL.get(sig, "—") + C.RESET +
-              C.DIM + "  [" + e.get("reason","—") + "]" + C.RESET)
+        print("  │  Signal      : " + col + C.BOLD + SIGNAL_LABEL.get(str(sig), "—") + C.RESET +
+              C.DIM + "  [" + str(e.get("reason") or "—") + "]" + C.RESET)
         print("  │  Price/ATR   : ₹" + str(e.get("price","—")) +
               "  ATR: ₹" + str(e.get("atr","—")) +
               "  ATR%: " + str(e.get("atr_pct",0)) + "%")
@@ -3999,7 +4204,7 @@ def view_detail(sym, data):
         row2 = ""
         if mc:
             mc_col = C.GREEN if mc == "BULL_CROSS" else C.RED
-            row2 += "  MACD: " + mc_col + mc + C.RESET
+            row2 += "  MACD: " + mc_col + str(mc) + C.RESET
         if st:
             st_col = C.GREEN if st == 1 else C.RED
             row2 += "  SuperTrend: " + st_col + ("BULL↑" if st==1 else "BEAR↓") + C.RESET
@@ -4076,16 +4281,23 @@ def view_detail(sym, data):
                          ("50.0%", fib.get("fib_50","")),
                          ("61.8%", fib.get("fib_61.8",""))]
             fib_line = "  │  Fib Key Lvl : "
-            p_now = e.get("price", 0)
+            # Bug fix: raw price/levels reached float() below — a legacy row
+            # holding "junk" in either raised TypeError/ValueError and killed
+            # the detail screen.  Coerce both sides first.
+            p_now = safe_float(e.get("price", 0))
             for lbl, lvl in fib_pairs:
                 if not lvl: continue
-                near = p_now and abs(float(lvl) - p_now) / max(p_now,0.01) < 0.025
+                near = (p_now and safe_float(lvl, 0.0) and
+                        abs(safe_float(lvl, 0.0) - p_now) / max(p_now, 0.01) < 0.025)
                 fib_line += (C.YELLOW if near else C.DIM) + lbl + "=₹" + str(lvl) + C.RESET + "  "
             print(fib_line)
 
         w52 = as_dict(e.get("52w"))
         if w52:
-            ph = w52.get("pct_from_high",0); pl = w52.get("pct_from_low",0)
+            # safe_float: junk pct_from_* in a legacy row made `ph >= -5`
+            # raise TypeError (str vs int) and killed the detail screen.
+            ph = safe_float(w52.get("pct_from_high"), 0.0)
+            pl = safe_float(w52.get("pct_from_low"),  0.0)
             ph_col = C.GREEN if ph >= -5 else (C.YELLOW if ph >= -15 else C.RED)
             pl_col = C.GREEN if pl >= 50 else (C.YELLOW if pl >= 20  else C.DIM)
             print("  │  52W          : High " + ph_col + "₹" + str(w52.get("high_52w","—")) +
@@ -4097,8 +4309,10 @@ def view_detail(sym, data):
             print("  │  " + C.YELLOW + C.BOLD + "⚡ Signal changed from " +
                   e.get("prev_signal","—") + C.RESET)
         if e.get("note"):
-            print("  │  Note         : " + C.YELLOW + e["note"] + C.RESET)
-        print("  │  Last update  : " + C.DIM + (e.get("updated") or "never") + C.RESET)
+            # str(): a legacy row can hold a non-str note — bare str+int would
+            # raise TypeError and kill the detail screen.
+            print("  │  Note         : " + C.YELLOW + str(e["note"]) + C.RESET)
+        print("  │  Last update  : " + C.DIM + str(e.get("updated") or "never") + C.RESET)
         print("  └" + "─" * (W - 3))
         print()
 
@@ -4118,9 +4332,9 @@ def view_detail(sym, data):
             elif hs == "BREAKDOWN":
                 htype = C.RED + "REVERSAL" + C.RESET if hpre == "BREAKOUT" else C.RED + "FRESH/CONT" + C.RESET
             else:
-                htype = C.DIM + hs + C.RESET
+                htype = C.DIM + str(hs) + C.RESET
             print("  " + _ljust(he.get("logged_at","—"), 18) + "  " +
-                  hcol + C.BOLD + SIGNAL_SHORT.get(hs,"--") + C.RESET +
+                  hcol + C.BOLD + SIGNAL_SHORT.get(str(hs),"--") + C.RESET +
                   "  " + _ljust(htype, 12) +
                   "  RSI:" + str(he.get("rsi",0)) +
                   "  RVol:" + str(he.get("rel_vol",0)))
@@ -4130,14 +4344,33 @@ def view_detail(sym, data):
     # ══ 6. TRADE PLAN ════════════════════════════════════════════
     cprint("  TRADE PLAN RECOMMENDATION", C.WHITE, bold=True)
     div("─")
-    # Find best TF setup (highest scoring breakout or breakdown)
-    best_tf = None; best_score = -1
-    for tf in tf_order:
-        e   = as_dict(sym_data[tf])
-        sig = e.get("signal","NONE")
-        cs  = e.get("composite_score",0)
-        if sig in ("BREAKOUT","BREAKDOWN") and cs > best_score:
-            best_score = cs; best_tf = tf
+    # Verdict FIRST: the recommended setup must agree with the STOCK SUMMARY
+    # printed immediately below. This used to pick the single highest
+    # composite score regardless of direction, so a screen with five
+    # BREAKOUT timeframes and one slightly higher-scoring MONTH BREAKDOWN
+    # recommended the SHORT (T1 far below entry) while the verdict said BUY
+    # with long targets — two opposite recommendations on one screen.
+    s       = generate_stock_summary(sym, sym_data, conf_tfs)
+    verdict = s["verdict"]
+    prefer  = ("BREAKOUT"   if verdict == "BUY" else
+               "BREAKDOWN"  if verdict == "SELL" else None)
+    # Best TF setup: highest composite score among setups that side WITH the
+    # verdict. If none exists (verdict from a NONE/SIDEWAYS primary), widen
+    # to any setup and flag the clash instead of silently contradicting it.
+    best_tf = None; best_score = -1; plan_conflict = False
+    for want in ((prefer, None) if prefer else (None,)):
+        for tf in tf_order:
+            e   = as_dict(sym_data[tf])
+            sig = e.get("signal","NONE")
+            cs  = safe_float(e.get("composite_score",0))
+            if (sig in ("BREAKOUT","BREAKDOWN")
+                    and (want is None or sig == want)
+                    and cs > best_score):
+                best_score = cs; best_tf = tf
+        if best_tf is not None:
+            break
+        if want is not None:
+            plan_conflict = True   # nothing in the verdict's direction
     if best_tf:
         be   = sym_data[best_tf]
         bsig = be.get("signal","NONE")
@@ -4146,12 +4379,16 @@ def view_detail(sym, data):
         print("  Best Setup    : " + bcol + C.BOLD + bsig + C.RESET +
               " on " + C.YELLOW + best_tf + C.RESET +
               "  Score: " + str(best_score) + "/100")
+        if plan_conflict:
+            cprint("  \u26a0 CONFLICT \u2014 no " + str(prefer) + " setup exists; this "
+                   "opposite-side setup is NOT what the VERDICT below calls for.",
+                   C.YELLOW)
         if btgt:
             print("  Entry         : " + C.CYAN + "₹" + str(be.get("price","—")) + C.RESET)
             print("  Target 1      : " + C.GREEN + "₹" + str(btgt.get("target1","—")) + C.RESET)
             print("  Target 2      : " + C.GREEN + "₹" + str(btgt.get("target2","—")) + C.RESET)
             print("  Stop Loss     : " + C.RED   + "₹" + str(btgt.get("stop","—"))    + C.RESET)
-            rr  = be.get("risk_reward",0)
+            rr  = safe_float(be.get("risk_reward",0))
             rrc = C.GREEN if rr >= 2 else (C.YELLOW if rr >= 1.5 else C.RED)
             print("  Risk:Reward   : " + rrc + str(rr) + ":1" + C.RESET)
         # Next day context
@@ -4172,7 +4409,8 @@ def view_detail(sym, data):
     print()
 
     # ══ 7. STOCK SUMMARY  (Buy / Sell reasons) ═══════════════════
-    s      = generate_stock_summary(sym, sym_data, conf_tfs)
+    # s (and its verdict) already computed above — the trade plan shows
+    # the same verdict's direction, so recompute nothing here.
     verdict    = s["verdict"]
     confidence = s["confidence"]
     v_col  = (C.GREEN  if verdict == "BUY"  else
@@ -4235,14 +4473,18 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     # ── Pick primary TF (DAY preferred, else first available) ─
     pri_tf  = "DAY" if "DAY" in sym_data else next(
         (tf for tf in TF_CONFIG if tf in sym_data), None)
-    e       = sym_data.get(pri_tf, {}) if pri_tf else {}
+    # Bug fix: sym_data[pri_tf] may be a corrupt non-dict JSON scalar —
+    # as_dict guarantees the .get chain below never raises.
+    e       = as_dict(sym_data.get(pri_tf)) if pri_tf else {}
     price   = safe_float(e.get("price",  0))
     sig     = e.get("signal",         "NONE")
     rsi     = safe_float(e.get("rsi",  50))
     rv      = safe_float(e.get("rel_vol", 1))
     cs      = safe_float(e.get("composite_score", 0))
     rr      = safe_float(e.get("risk_reward", 0))
-    ema_aln = e.get("ema_alignment", "")
+    # str(): a legacy row can hold a non-str here; `in ema_aln` would raise
+    # TypeError: argument of type 'int' is not iterable.
+    ema_aln = str(e.get("ema_alignment", "") or "")
     mc      = e.get("macd_cross", "")
     st      = int(safe_float(e.get("st_direction", 0)))
     cps     = as_list(e.get("candle_patterns"))
@@ -4276,9 +4518,15 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     else:
         cautions.append("No clear signal on " + (pri_tf or "DAY") + " timeframe")
 
-    if conf >= max(2, len(tfs) - 1):
+    # Bug fix: the old `conf >= max(2, len(tfs) - 1)` fired on ALL-but-one
+    # agreement and still printed "ALL N active timeframes agree" — with 3 TFs
+    # a single SIDEWAYS/NONE timeframe produced a false "ALL 3" claim.  conf
+    # can only equal ±len(tfs) when every timeframe actually voted the same
+    # way (SIDEWAYS/NONE contribute 0), so claim ALL only then.  Partial
+    # alignment is already reported by the multi-TF block below.
+    if len(tfs) >= 2 and conf >= len(tfs):
         buy_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bullish")
-    elif conf <= -max(2, len(tfs) - 1):
+    elif len(tfs) >= 2 and conf <= -len(tfs):
         sell_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bearish")
 
     # ── MULTI-TF CONFLUENCE ───────────────────────────────────
@@ -4338,13 +4586,18 @@ def generate_stock_summary(sym, sym_data, tfs=None):
 
     # ── EMA ALIGNMENT ─────────────────────────────────────────
     if "FULL BULL" in ema_aln:
+        # Structural wording only: the FULL BULL/BEAR labels assert the
+        # EMA-to-EMA ORDER (EMA9/21/50/200 crossovers), not where price sits
+        # versus every average — e.g. a FULL BEAR stack can still trade above
+        # its own EMA50, so "price below all key EMAs / every MA resisting
+        # above price" was simply false (contradicted the per-TF reasons).
         buy_reasons.append(
             "EMA stack is fully bullish (EMA9 > EMA21 > EMA50 > EMA200) — "
-            "price is above all key moving averages; the trend is unambiguously up")
+            "the trend structure is unambiguously up")
     elif "FULL BEAR" in ema_aln:
         sell_reasons.append(
-            "EMA stack is fully bearish (price below all key EMAs) — "
-            "every moving average is acting as resistance above price")
+            "EMA stack is fully bearish (EMA9 < EMA21 < EMA50 < EMA200) — "
+            "the trend structure is down; rallies tend to stall under the descending averages")
     elif "BULLISH" in ema_aln:
         buy_reasons.append(
             "EMA alignment is bullish — short-term average is above medium-term; "
@@ -4425,18 +4678,39 @@ def generate_stock_summary(sym, sym_data, tfs=None):
         f618 = safe_float(fib.get("fib_61.8", 0))
         sw_h = safe_float(fib.get("sw_high",  0))
         sw_l = safe_float(fib.get("sw_low",   0))
-        for pct_lbl, lvl in [("38.2%", f382), ("50.0%", f500), ("61.8%", f618)]:
-            if lvl and abs(price - lvl) / max(price, 0.01) < 0.025:
-                if sig == "BREAKOUT":
-                    buy_reasons.append(
-                        "Price is bouncing off the " + pct_lbl +
-                        " Fibonacci retracement (₹" + str(lvl) +
-                        ") — a textbook pullback-to-fib buy zone")
-                else:
-                    cautions.append(
-                        "Price is near the " + pct_lbl +
-                        " Fibonacci level (₹" + str(lvl) +
-                        ") — key decision zone; watch for rejection or breakout")
+        near_fibs = [(lbl, lvl) for lbl, lvl in
+                     [("38.2%", f382), ("50.0%", f500), ("61.8%", f618)]
+                     if lvl and abs(price - lvl) / max(price, 0.01) < 0.025]
+        if len(near_fibs) == 1:
+            pct_lbl, lvl = near_fibs[0]
+            if sig == "BREAKOUT":
+                buy_reasons.append(
+                    "Price is bouncing off the " + pct_lbl +
+                    " Fibonacci retracement (₹" + str(lvl) +
+                    ") — a textbook pullback-to-fib buy zone")
+            else:
+                cautions.append(
+                    "Price is near the " + pct_lbl +
+                    " Fibonacci level (₹" + str(lvl) +
+                    ") — key decision zone; watch for rejection or breakout")
+        elif near_fibs:
+            # Several fib levels clustered around price (within 2.5% each):
+            # credit the whole retracement zone ONCE. The old per-level loop
+            # counted the same zone twice — "bouncing off 50% AND 61.8%" can
+            # never both be true — inflating buy/caution factor counts.
+            zone_lbl = "–".join(lbl for lbl, _ in near_fibs)   # 38.2 > 50 > 61.8 in price
+            zone_txt = "₹" + str(min(l for _, l in near_fibs)) + "–₹" + \
+                       str(max(l for _, l in near_fibs))
+            if sig == "BREAKOUT":
+                buy_reasons.append(
+                    "Price is inside the Fibonacci retracement buy zone (" +
+                    zone_lbl + ": " + zone_txt +
+                    ") — a textbook pullback-to-fib support zone")
+            else:
+                cautions.append(
+                    "Price is inside the key Fibonacci zone (" +
+                    zone_lbl + ": " + zone_txt +
+                    ") — decision zone; watch for rejection or breakout")
         if sw_h and price >= sw_h * 0.99:
             cautions.append(
                 "Price is near the swing high (₹" + str(sw_h) +
@@ -4845,7 +5119,7 @@ def statistics_view(data):
             if tf not in entry:
                 continue
             e = as_dict(entry[tf])
-            s = e.get("signal", "NONE")
+            s = str(e.get("signal", "NONE"))   # str(): unhashable junk signal
             counts[s] = counts.get(s, 0) + 1
             if s != "NONE":
                 liq_s += safe_float(e.get("atr_pct", 0))
@@ -4940,7 +5214,7 @@ def history_view(sym, tf):
         sig  = e.get("signal",      "NONE")
         pre  = e.get("prev_signal", "NONE")
         col  = signal_color(sig)
-        sig_tag = col + C.BOLD + SIGNAL_SHORT.get(sig, "--") + C.RESET
+        sig_tag = col + C.BOLD + SIGNAL_SHORT.get(str(sig), "--") + C.RESET
         rsi  = safe_float(e.get("rsi", 0))
 
         # ── Breakout / breakdown type ─────────────────────────────
@@ -4973,7 +5247,7 @@ def history_view(sym, tf):
               _rjust(str(e.get("rel_vol", 0)),        5) + "  " +
               _rjust(str(e.get("volume",  0)) + "%",  4) + "  " +
               _rjust(str(e.get("atr_pct", 0)) + "%",  5) + "  " +
-              (C.YELLOW + e.get("note","") + C.RESET if e.get("note") else ""))
+                  (C.YELLOW + str(e.get("note")) + C.RESET if e.get("note") else ""))
 
     div()
 
@@ -5010,7 +5284,9 @@ def best_setups_view(data, tfs=None):
     rows = []
     for sym, entry in data.items():
         tf_key = _score_tf_key(entry, tfs)
-        e      = entry.get(tf_key, {})
+        # Bug fix: entry[tf_key] can be a corrupt non-dict JSON scalar —
+        # `.get(..., {})` doesn't guard that, so as_dict is required here.
+        e      = as_dict(entry.get(tf_key))
         cscore = safe_float(e.get("composite_score", 0))
         sig    = e.get("signal", "NONE")
         price  = safe_float(e.get("price", 0))
@@ -5063,7 +5339,7 @@ def best_setups_view(data, tfs=None):
 
         print("  " +
               _ljust(col + sym + C.RESET, 12) + "  " +
-              _ljust(col + sig + C.RESET,  8) + "  " +
+              _ljust(col + str(sig) + C.RESET,  8) + "  " +
               _rjust(sc_col + str(cscore) + C.RESET, 4) + "  " +
               _rjust(price_str, 9) + "  " +
               _rjust(rr_col + str(rr) + C.RESET, 5) + "  " +
@@ -5091,7 +5367,7 @@ def watchlist_view(data, tfs=None):
             continue
         entry  = data[sym]
         tf_key = _score_tf_key(entry, tfs)
-        e      = entry.get(tf_key, {})
+        e      = as_dict(entry.get(tf_key))   # corrupt rows may hold scalars
         sig    = e.get("signal", "NONE")
         col    = signal_color(sig)
         price  = safe_float(e.get("price", 0))
@@ -5105,7 +5381,7 @@ def watchlist_view(data, tfs=None):
 
         print("  " + C.YELLOW + "★ " + C.RESET +
               C.BOLD + _ljust(sym, 12) + C.RESET + "  " +
-              col + C.BOLD + "{:<10}".format(sig) + C.RESET +
+              col + C.BOLD + "{:<10}".format(str(sig)) + C.RESET +
               "  " + signals_str +
               "  Scr:" + sc_col + str(cscore) + C.RESET +
               "  R:R " + str(rr) +
@@ -5117,9 +5393,11 @@ def watchlist_view(data, tfs=None):
                 tgt.get("target1","—"), tgt.get("target2","—"), tgt.get("stop","—")))
         w52 = as_dict(e.get("52w"))
         if w52:
+            # safe_float: a legacy row can hold junk in pct_from_* and the
+            # {:+.1f} format would raise ValueError mid-list.
             print("    52W H: ₹{} ({:+.1f}%)  52W L: ₹{} ({:+.1f}%)".format(
-                w52.get("high_52w","—"), w52.get("pct_from_high",0),
-                w52.get("low_52w","—"),  w52.get("pct_from_low",0)))
+                w52.get("high_52w","—"), safe_float(w52.get("pct_from_high"), 0.0),
+                w52.get("low_52w","—"),  safe_float(w52.get("pct_from_low"),  0.0)))
         div("·", 60)
     print()
 
@@ -5132,7 +5410,7 @@ def candle_pattern_view(data, tfs=None):
     found = False
     for sym, entry in sorted(data.items()):
         tf_key = _score_tf_key(entry, tfs)
-        e      = entry.get(tf_key, {})
+        e      = as_dict(entry.get(tf_key))   # corrupt rows may hold scalars
         cps    = as_list(e.get("candle_patterns"))
         if not cps:
             continue
@@ -5144,10 +5422,10 @@ def candle_pattern_view(data, tfs=None):
         other   = [p for p in cps if p not in CANDLE_BULL + CANDLE_BEAR]
 
         print("  " + C.BOLD + _ljust(sym, 14) + C.RESET +
-              col + "{:<10}".format(sig) + C.RESET + "  " +
-              (C.GREEN + " ".join(bull_cp) + C.RESET + "  " if bull_cp else "") +
-              (C.RED   + " ".join(bear_cp) + C.RESET + "  " if bear_cp else "") +
-              (C.YELLOW+ " ".join(other)   + C.RESET if other else ""))
+              col + "{:<10}".format(str(sig)) + C.RESET + "  " +
+              (C.GREEN + " ".join(str(p) for p in bull_cp) + C.RESET + "  " if bull_cp else "") +
+              (C.RED   + " ".join(str(p) for p in bear_cp) + C.RESET + "  " if bear_cp else "") +
+              (C.YELLOW+ " ".join(str(p) for p in other)   + C.RESET if other else ""))
 
     if not found:
         cprint("  No patterns detected. Run a scan to populate data.\n", C.YELLOW)
@@ -5205,9 +5483,11 @@ def export_csv(data, tfs=None):
                     "st_direction":    e.get("st_direction",   0),
                     "ema_alignment":   e.get("ema_alignment",  ""),
                     "confluence":      conf,
-                    "candle_patterns": "|".join(cps),
-                    "rsi_div_bull":    int(div_.get("regular_bull", False) or div_.get("hidden_bull", False)),
-                    "rsi_div_bear":    int(div_.get("regular_bear", False) or div_.get("hidden_bear", False)),
+                    "candle_patterns": "|".join(str(p) for p in cps),
+                    # bool() first: a legacy row can hold a truthy non-bool
+                    # ("yes") here and int() would raise ValueError.
+                    "rsi_div_bull":    int(bool(div_.get("regular_bull", False) or div_.get("hidden_bull", False))),
+                    "rsi_div_bear":    int(bool(div_.get("regular_bear", False) or div_.get("hidden_bear", False))),
                     "fib_38":          fib.get("fib_38.2", ""),
                     "fib_50":          fib.get("fib_50",   ""),
                     "fib_62":          fib.get("fib_61.8", ""),
@@ -5255,10 +5535,10 @@ def export_report(data, tfs=None):
             cps = as_list(e.get("candle_patterns"))
             lines += [
                 "  " + tf,
-                "    Signal       : " + e.get("signal",   "—"),
-                "    Reason       : " + e.get("reason",   "—"),
+                "    Signal       : " + str(e.get("signal") or "—"),
+                "    Reason       : " + str(e.get("reason") or "—"),
                 "    Price        : ₹" + str(e.get("price", "—")),
-                "    Vol/ATR%     : " + str(e.get("volume", "—")) + "% / " + "{:.1f}".format(float(e.get("atr_pct", 0))) + "%",
+                "    Vol/ATR%     : " + str(e.get("volume", "—")) + "% / " + "{:.1f}".format(safe_float(e.get("atr_pct", 0))) + "%",
                 "    RSI          : " + str(e.get("rsi", "—")),
                 "    RelVol       : " + str(e.get("rel_vol", "—")),
                 "    Trend Str    : " + str(e.get("trend_strength", 0)),
@@ -5268,7 +5548,7 @@ def export_report(data, tfs=None):
                 "    MACD Cross   : " + str(e.get("macd_cross", "—")),
                 "    SuperTrend   : " + ("BULL" if e.get("st_direction") == 1 else
                                          "BEAR" if e.get("st_direction") == -1 else "—"),
-                "    Candle Pats  : " + (" | ".join(cps) if cps else "—"),
+                "    Candle Pats  : " + (" | ".join(str(p) for p in cps) if cps else "—"),
                 "    RSI Div Bull : " + ("Yes" if div_.get("regular_bull") or div_.get("hidden_bull") else "No"),
                 "    RSI Div Bear : " + ("Yes" if div_.get("regular_bear") or div_.get("hidden_bear") else "No"),
             ]
@@ -5281,8 +5561,8 @@ def export_report(data, tfs=None):
                 ]
             if w52:
                 lines += [
-                    "    52W High     : ₹{} ({:+.1f}%)".format(w52.get("high_52w","—"), w52.get("pct_from_high",0)),
-                    "    52W Low      : ₹{} ({:+.1f}%)".format(w52.get("low_52w","—"),  w52.get("pct_from_low",0)),
+                    "    52W High     : ₹{} ({:+.1f}%)".format(w52.get("high_52w","—"), safe_float(w52.get("pct_from_high"), 0.0)),
+                    "    52W Low      : ₹{} ({:+.1f}%)".format(w52.get("low_52w","—"),  safe_float(w52.get("pct_from_low"),  0.0)),
                 ]
             tgt = as_dict(e.get("targets"))
             if tgt:
@@ -5296,7 +5576,7 @@ def export_report(data, tfs=None):
             if supp: lines.append("    Support      : " + ", ".join("₹" + str(s) for s in supp))
             if res:  lines.append("    Resistance   : " + ", ".join("₹" + str(r) for r in res))
             if e.get("note"):
-                lines.append("    Note         : " + e["note"])
+                lines.append("    Note         : " + str(e["note"]))
             if e.get("signal_changed"):
                 lines.append("    ⚡ CHANGED    : from " + e.get("prev_signal","—"))
             lines.append("")
@@ -5337,7 +5617,7 @@ def export_html(data, tfs=None):
 
     # ── Helper: signal → CSS class ────────────────────────────
     def sc(sig):
-        return {"BREAKOUT":"bo","BREAKDOWN":"bd","SIDEWAYS":"sw"}.get(sig,"none")
+        return {"BREAKOUT":"bo","BREAKDOWN":"bd","SIDEWAYS":"sw"}.get(str(sig),"none")
 
     def fmt_p(v):
         try:
@@ -5345,7 +5625,10 @@ def export_html(data, tfs=None):
             if f >= 10000: return "₹{:,.0f}".format(f)
             if f >= 1000:  return "₹{:,.1f}".format(f)
             return "₹{:.2f}".format(f)
-        except Exception: return "₹" + str(v)
+        # Non-numeric junk from a corrupt row must be escaped like every other
+        # interpolated string — otherwise "<script>" in a price field lands
+        # raw in the report.
+        except Exception: return "₹" + esc(str(v))
 
     def safe(v, d=0.0):
         try:
@@ -5557,7 +5840,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="nav"><div class="nav-title">Symbols</div>')
     for sym, e in ranked:
         sig = as_dict(e.get("DAY")).get("signal", "NONE")
-        w('<a href="#sym-' + sym + '" class="' + sc(sig) + '">' + sym + '</a>')
+        w('<a href="#sym-' + esc(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
     w('</div>')
 
     w('<div class="wrap">')
@@ -5567,7 +5850,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="card gr"><div class="card-lbl">Breakout (Day)</div><div class="card-val">' + str(bo_d) + '</div><div class="card-sub">' + str(round(bo_d/max(len(data),1)*100)) + '% of universe</div></div>')
     w('<div class="card re"><div class="card-lbl">Breakdown (Day)</div><div class="card-val">' + str(bd_d) + '</div><div class="card-sub">' + str(round(bd_d/max(len(data),1)*100)) + '% of universe</div></div>')
     w('<div class="card ye"><div class="card-lbl">All-TF Breakout</div><div class="card-val">' + str(len(all_bo_syms)) + '</div><div class="card-sub">' + ', '.join(tfs) + ' aligned</div></div>')
-    w('<div class="card bl"><div class="card-lbl">All-TF Breakdown</div><div class="card-val">' + str(len(all_bd_syms)) + '</div><div class="card-sub">' + (', '.join(all_bd_syms[:3]) or 'None') + '</div></div>')
+    w('<div class="card bl"><div class="card-lbl">All-TF Breakdown</div><div class="card-val">' + str(len(all_bd_syms)) + '</div><div class="card-sub">' + (', '.join(esc(s) for s in all_bd_syms[:3]) or 'None') + '</div></div>')
     w('</div>')
 
     # ── SECTOR HEATMAP + BEST SETUPS ─────────────────────────
@@ -5582,7 +5865,7 @@ tr:last-child td{border-bottom:none}
         hbo = max(int(c["BO"]/tot*40), 2 if c["BO"] else 0)
         hbd = max(int(c["BD"]/tot*40), 2 if c["BD"] else 0)
         hsw = max(int(c["SW"]/tot*40), 2 if c["SW"] else 0)
-        w('<div class="sec-cell"><div class="sec-name">' + sec + '</div>')
+        w('<div class="sec-cell"><div class="sec-name">' + esc(sec) + '</div>')
         w('<div class="sec-bars">')
         if c["BO"]: w('<div class="sec-bar" style="height:' + str(hbo) + 'px;background:var(--gr);opacity:.85"></div>')
         if c["BD"]: w('<div class="sec-bar" style="height:' + str(hbd) + 'px;background:var(--re);opacity:.85"></div>')
@@ -5638,7 +5921,7 @@ tr:last-child td{border-bottom:none}
         rsi = safe(de.get("rsi",0))
         rv  = safe(de.get("rel_vol",0))
         rr  = safe(de.get("risk_reward",0))
-        ema = de.get("ema_alignment","")
+        ema = str(de.get("ema_alignment", "") or "")
         cps = as_list(de.get("candle_patterns"))
         rsi_cls = "rsi-ob" if rsi>70 else ("rsi-bull" if rsi>55 else ("rsi-mid" if rsi>40 else "rsi-os"))
         rr_col = "var(--gr)" if rr>=1 else ("var(--ye)" if rr>=0.5 else "var(--re)")
@@ -5646,10 +5929,10 @@ tr:last-child td{border-bottom:none}
         ema_col = "var(--gr)" if "FULL BULL" in ema else ("var(--re)" if "FULL BEAR" in ema else ("var(--gr)" if "BULL" in ema else ("var(--re)" if "BEAR" in ema else "var(--mu)")))
         chips = "".join('<span class="chip">' + esc(p) + '</span>' for p in cps)
         w('<tr><td><a href="#sym-' + esc(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
-        w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(sig,"--") + '</span></td>')
+        w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(str(sig),"--") + '</span></td>')
         for tf in tfs:
             s2 = as_dict(e.get(tf)).get("signal","NONE")
-            w('<td><span class="badge ' + sc(s2) + '">' + SIGNAL_SHORT.get(s2,"--") + '</span></td>')
+            w('<td><span class="badge ' + sc(s2) + '">' + SIGNAL_SHORT.get(str(s2),"--") + '</span></td>')
         w('<td><div class="sbar-num" style="color:' + sc_col + '">' + str(cs) + '</div><div class="sbar-wrap"><div class="sbar-bg"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></div></td>')
         w('<td class="mono">' + fmt_p(de.get("price",0)) + '</td>')
         w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
@@ -5671,7 +5954,7 @@ tr:last-child td{border-bottom:none}
         day_e   = as_dict(e.get("DAY"))
         price   = safe(day_e.get("price",0))
 
-        w('<div class="det-card" id="sym-' + sym + '">')
+        w('<div class="det-card" id="sym-' + esc(sym) + '">')
         w('<div class="det-hdr">')
         w('  <div>')
         w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:13px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
@@ -5681,7 +5964,7 @@ tr:last-child td{border-bottom:none}
         for tf in list(TF_CONFIG.keys()):
             if tf in e:
                 s2 = as_dict(e[tf]).get("signal", "NONE")
-                w('    <div class="tfd ' + sc(s2) + '" title="' + esc(tf + ': ' + s2) + '">' + tf[:1] + ('M' if tf=="15MIN" else tf[1:2] if tf not in ["5MIN","1HR","DAY"] else '') + '</div>')
+                w('    <div class="tfd ' + sc(s2) + '" title="' + esc(str(tf) + ': ' + str(s2)) + '">' + tf[:1] + ('M' if tf=="15MIN" else tf[1:2] if tf not in ["5MIN","1HR","DAY"] else '') + '</div>')
         w('  </div>')
         w('</div>')
         w('<div class="det-body">')
@@ -5707,7 +5990,7 @@ tr:last-child td{border-bottom:none}
             rsi_cls = "rsi-ob" if rsi>70 else ("rsi-bull" if rsi>55 else ("rsi-mid" if rsi>40 else "rsi-os"))
             rv_col = "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")
             w('<tr><td class="mono" style="font-weight:700">' + tf + '</td>')
-            w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(sig,"--") + '</span>' + chg_tag + '</td>')
+            w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(str(sig),"--") + '</span>' + chg_tag + '</td>')
             w('<td><div style="color:' + sc_col + ';font-family:var(--mono);font-size:11px">' + str(cs) + '</div><div class="sbar-bg" style="width:45px;margin-top:2px"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></td>')
             w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
             w('<td class="mono" style="color:' + rv_col + '">' + str(rv) + '×</td>')
@@ -5726,7 +6009,7 @@ tr:last-child td{border-bottom:none}
             rsi   = safe(te.get("rsi",0))
             rv    = safe(te.get("rel_vol",0))
             ts    = safe(te.get("trend_strength",0))
-            ema   = te.get("ema_alignment","")
+            ema   = str(te.get("ema_alignment", "") or "")
             st    = int(safe(te.get("st_direction",0)))
             mc    = te.get("macd_cross","")
             rr    = safe(te.get("risk_reward",0))
@@ -5737,7 +6020,7 @@ tr:last-child td{border-bottom:none}
             fib   = as_dict(te.get("fibonacci"))
             w52   = as_dict(te.get("52w"))
             div_  = as_dict(te.get("rsi_divergence"))
-            reason= te.get("reason","")
+            reason= str(te.get("reason", "") or "")
             pr    = safe(te.get("price",0))
             ema_col = "var(--gr)" if "BULL" in ema else ("var(--re)" if "BEAR" in ema else "var(--mu)")
             st_txt  = ("↑ BULL" if st==1 else ("↓ BEAR" if st==-1 else "—"))
@@ -5749,7 +6032,7 @@ tr:last-child td{border-bottom:none}
             w('<div class="tf-block"><div class="tf-block-hdr">')
             w('<span style="color:var(--mu);font-size:9px;font-weight:400">──</span>')
             w('<span style="color:var(--ye)">' + tf + '</span>')
-            w('<span class="badge ' + sc(sig) + '">' + sig + '</span>')
+            w('<span class="badge ' + sc(sig) + '">' + esc(str(sig)) + '</span>')
             w('<span style="color:' + sc_col + ';font-size:11px">' + str(cs) + '/100</span>')
             w('<span style="color:var(--mu);font-size:10px;font-weight:400;margin-left:auto">R:R <span style="color:' + ("var(--gr)" if rr>=1 else "var(--ye)") + '">' + str(rr) + ':1</span></span>')
             w('</div>')
@@ -5772,8 +6055,8 @@ tr:last-child td{border-bottom:none}
             # S/R + targets
             if supp or res or tgt:
                 w('<div style="padding:8px 12px;border-top:1px solid var(--bd)">')
-                if supp: w('<div style="font-size:11px;margin-bottom:4px">Support: ' + '&nbsp;'.join('<span class="mono gr">₹'+str(s)+'</span>' for s in supp) + '</div>')
-                if res:  w('<div style="font-size:11px;margin-bottom:4px">Resistance: ' + '&nbsp;'.join('<span class="mono re">₹'+str(r)+'</span>' for r in res) + '</div>')
+                if supp: w('<div style="font-size:11px;margin-bottom:4px">Support: ' + '&nbsp;'.join('<span class="mono gr">₹'+esc(str(s))+'</span>' for s in supp) + '</div>')
+                if res:  w('<div style="font-size:11px;margin-bottom:4px">Resistance: ' + '&nbsp;'.join('<span class="mono re">₹'+esc(str(r))+'</span>' for r in res) + '</div>')
                 if tgt:
                     t1 = tgt.get("target1",""); t2 = tgt.get("target2",""); sl = tgt.get("stop","")
                     w('<div class="tgt-row">')
@@ -5797,22 +6080,24 @@ tr:last-child td{border-bottom:none}
                 fib_line = '<span style="font-size:10px;color:var(--mu)">Fib:</span>'
                 for lbl,lvl in [("38.2%",f382),("50%",f500),("61.8%",f618)]:
                     if lvl:
-                        near = pr and abs(float(lvl)-pr)/max(pr,0.01) < 0.025
-                        fib_line += ' <span class="mono" style="color:' + ("var(--ye)" if near else "var(--mu)") + '">' + lbl + '=₹' + str(lvl) + '</span>'
-                if sw_h: fib_line += ' <span class="mono mu">H₹' + str(sw_h) + ' L₹' + str(sw_l) + '</span>'
+                        # Bug fix: raw float(lvl) raised ValueError on a junk
+                        # level, and str(lvl) was interpolated unescaped.
+                        near = pr and abs(safe(lvl)-pr)/max(pr,0.01) < 0.025
+                        fib_line += ' <span class="mono" style="color:' + ("var(--ye)" if near else "var(--mu)") + '">' + lbl + '=₹' + esc(str(lvl)) + '</span>'
+                if sw_h: fib_line += ' <span class="mono mu">H₹' + esc(str(sw_h)) + ' L₹' + esc(str(sw_l)) + '</span>'
                 extras.append(fib_line)
             if w52:
                 ph = safe(w52.get("pct_from_high",0)); pl = safe(w52.get("pct_from_low",0))
                 ph_col = "var(--gr)" if ph>=-5 else ("var(--ye)" if ph>=-15 else "var(--re)")
-                extras.append('<span style="font-size:10px;color:var(--mu)">52W:</span> <span class="mono" style="color:' + ph_col + '">High ₹' + str(w52.get("high_52w","")) + ' (' + str(ph) + '%)</span> <span class="mono mu">Low ₹' + str(w52.get("low_52w","")) + ' (+' + str(pl) + '%)</span>')
+                extras.append('<span style="font-size:10px;color:var(--mu)">52W:</span> <span class="mono" style="color:' + ph_col + '">High ₹' + esc(str(w52.get("high_52w",""))) + ' (' + str(ph) + '%)</span> <span class="mono mu">Low ₹' + esc(str(w52.get("low_52w",""))) + ' (+' + str(pl) + '%)</span>')
             div_items = []
             if div_.get("regular_bull"): div_items.append('<span style="color:var(--gr)">Reg.Bull▲</span>')
             if div_.get("hidden_bull"):  div_items.append('<span style="color:var(--gr)">Hid.Bull▲</span>')
             if div_.get("regular_bear"): div_items.append('<span style="color:var(--re)">Reg.Bear▼</span>')
             if div_.get("hidden_bear"):  div_items.append('<span style="color:var(--re)">Hid.Bear▼</span>')
             if div_items: extras.append('<span style="font-size:10px;color:var(--mu)">RSI Div:</span> ' + " ".join(div_items))
-            if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT R1=₹' + str(te.get("retest_bo_level","")) + '</span>')
-            if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN S1=₹' + str(te.get("retest_bd_level","")) + '</span>')
+            if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT R1=₹' + esc(str(te.get("retest_bo_level",""))) + '</span>')
+            if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN S1=₹' + esc(str(te.get("retest_bd_level",""))) + '</span>')
 
             if extras:
                 w('<div style="padding:6px 12px;border-top:1px solid var(--bd);display:flex;flex-wrap:wrap;gap:10px">')
@@ -5944,8 +6229,10 @@ def edit_note(sym, data):
         for tf in list(TF_CONFIG.keys()):
             if isinstance(as_dict(data.get(sym)).get(tf), dict):
                 data[sym][tf]["note"] = n
-        save_data(data)
-        cprint("  ✓ Note saved.", C.GREEN)
+        if save_data(data):
+            cprint("  ✓ Note saved.", C.GREEN)
+        else:
+            cprint("  ✗ SAVE FAILED — the note was NOT persisted.", C.RED)
     else:
         cprint("  Note unchanged.", C.DIM)
     input("  Press ENTER...")
@@ -6015,13 +6302,25 @@ def calc_next_day_gap_score(sym_data):
     # ── 2. Multi-TF signal confluence ────────────────────────
     # Swing TF confluence (DAY/WEEK/MONTH) carries the most weight for next-day gaps.
     tfs_all   = ["DAY", "WEEK", "MONTH"]
-    conf_raw  = sum({"BREAKOUT":1,"BREAKDOWN":-1}.get(
-                    as_dict(sym_data.get(tf)).get("signal","NONE"), 0)
-                    for tf in tfs_all)
+    swing_sig = [str(as_dict(sym_data.get(tf)).get("signal", "NONE"))
+                 for tf in tfs_all]
+    bo_n      = sum(1 for s in swing_sig if s == "BREAKOUT")
+    bd_n      = sum(1 for s in swing_sig if s == "BREAKDOWN")
+    conf_raw  = bo_n - bd_n              # unchanged weighting: -3..+3
     pts = conf_raw * 6   # -18..+18
-    label = {3:"All TFs BREAKOUT", 2:"2 TFs BREAKOUT", 1:"1 TF BREAKOUT",
-             0:"Mixed/Neutral", -1:"1 TF BREAKDOWN", -2:"2 TFs BREAKDOWN",
-             -3:"All TFs BREAKDOWN"}.get(conf_raw, "Mixed")
+    # Count BOTH sides. Keying the label on the net score used to read
+    # "1 TF BREAKOUT" when two swing TFs had broken out and one had broken
+    # DOWN (net +1) — hiding the conflict behind a single number.
+    if bo_n and not bd_n:
+        label = ("All %d TFs BREAKOUT" % bo_n) if bo_n == len(tfs_all) \
+                else ("%d/%d TFs BREAKOUT" % (bo_n, len(tfs_all)))
+    elif bd_n and not bo_n:
+        label = ("All %d TFs BREAKDOWN" % bd_n) if bd_n == len(tfs_all) \
+                else ("%d/%d TFs BREAKDOWN" % (bd_n, len(tfs_all)))
+    elif bo_n or bd_n:
+        label = "Mixed: %d BREAKOUT / %d BREAKDOWN" % (bo_n, bd_n)
+    else:
+        label = "No swing TF signal"
     raw += pts; facts.append(("Confluence: " + label, pts))
 
     # ── 2b. Intraday TF direction adjustment ─────────────────
@@ -6033,11 +6332,22 @@ def calc_next_day_gap_score(sym_data):
     intra_sigs = [as_dict(sym_data.get(tf)).get("signal", "NONE") for tf in tfs_intra
                   if as_dict(sym_data.get(tf)).get("signal", "NONE") != "NONE"]
     if intra_sigs:
-        intra_raw = sum({"BREAKOUT":1,"BREAKDOWN":-1}.get(s, 0) for s in intra_sigs)
+        intra_raw = sum({"BREAKOUT":1,"BREAKDOWN":-1}.get(str(s), 0) for s in intra_sigs)
         # Scale: ±3 intraday TFs → ±8 pts (less influential than swing ±18)
         intra_pts = round(intra_raw / max(len(intra_sigs), 1) * 8)
         if intra_pts != 0:
-            i_dir = "bullish" if intra_pts > 0 else "bearish"
+            # Count BOTH sides — same fix as the swing-confluence label above.
+            # The net score alone labelled 2 breakouts + 1 breakdown as simply
+            # "bullish", hiding the opposing intraday vote that the signal
+            # snapshot shows a few lines higher (e.g. 5MIN/15MIN BO, 1HR BD).
+            i_bo = sum(1 for s in intra_sigs if str(s) == "BREAKOUT")
+            i_bd = sum(1 for s in intra_sigs if str(s) == "BREAKDOWN")
+            if i_bo and not i_bd:
+                i_dir = "bullish"
+            elif i_bd and not i_bo:
+                i_dir = "bearish"
+            else:
+                i_dir = "mixed (%d BO / %d BD)" % (i_bo, i_bd)
             raw += intra_pts
             facts.append(("Intraday (" + "/".join(tfs_intra) + ") " + i_dir, intra_pts))
 
@@ -6076,7 +6386,8 @@ def calc_next_day_gap_score(sym_data):
     raw += pts; facts.append(("Candle: " + label, pts))
 
     # ── 6. EMA alignment ─────────────────────────────────────
-    ema = e.get("ema_alignment", "")
+    # str(): `in ema` raises TypeError when a legacy row holds a non-str
+    ema = str(e.get("ema_alignment", "") or "")
     if   "FULL BULL" in ema: pts = 10; label = "Full Bull EMA Stack"
     elif "BULLISH"   in ema: pts =  5; label = "EMA bullish"
     elif "FULL BEAR" in ema: pts =-10; label = "Full Bear EMA Stack"
@@ -6129,7 +6440,8 @@ def next_day_gap_view(data):
         input("  Press ENTER..."); return
 
     # Check if DAY data exists
-    has_day = any("DAY" in entry and entry["DAY"].get("price",0) for entry in data.values())
+    # Bug fix: entry["DAY"] could be a corrupt non-dict scalar → AttributeError.
+    has_day = any(as_dict(entry.get("DAY")).get("price", 0) for entry in data.values())
     if not has_day:
         cprint("  No DAY timeframe data found. Run scan with DAY tf included.", C.YELLOW)
         input("  Press ENTER..."); return
@@ -6181,7 +6493,7 @@ def next_day_gap_view(data):
         else:             bar_col = C.YELLOW
         bar_str  = "[" + bar_col + "█" * filled + C.DIM + "░" * (bar_len - filled) + C.RESET + "]"
 
-        sig_s    = signal_color(sig) + SIGNAL_SHORT.get(sig, "--") + C.RESET
+        sig_s    = signal_color(sig) + SIGNAL_SHORT.get(str(sig), "--") + C.RESET
         rsi_col  = C.RED if rsi > 75 else C.GREEN if rsi > 55 else C.YELLOW if rsi > 40 else C.RED
         pr_str   = fmt_price(price)
         sc_col   = bias_col
@@ -6316,9 +6628,11 @@ def heatmap_view(data, tfs=None):
         syms = sectors[sec]
         # Sector-level counts (DAY or first TF)
         pri_tf = "DAY" if "DAY" in tf_show else tf_show[0]
-        sec_bo = sum(1 for s in syms if data[s].get(pri_tf, {}).get("signal") == "BREAKOUT")
-        sec_bd = sum(1 for s in syms if data[s].get(pri_tf, {}).get("signal") == "BREAKDOWN")
-        sec_sw = sum(1 for s in syms if data[s].get(pri_tf, {}).get("signal") == "SIDEWAYS")
+        # Bug fix: data[s][pri_tf] may be a corrupt non-dict scalar — as_dict
+        # keeps the sector counts from raising AttributeError mid-render.
+        sec_bo = sum(1 for s in syms if as_dict(data[s].get(pri_tf)).get("signal") == "BREAKOUT")
+        sec_bd = sum(1 for s in syms if as_dict(data[s].get(pri_tf)).get("signal") == "BREAKDOWN")
+        sec_sw = sum(1 for s in syms if as_dict(data[s].get(pri_tf)).get("signal") == "SIDEWAYS")
         grand_bo += sec_bo; grand_bd += sec_bd; grand_sw += sec_sw
 
         sec_col = (C.GREEN  if sec_bo > sec_bd else
@@ -6336,7 +6650,7 @@ def heatmap_view(data, tfs=None):
             star   = C.YELLOW + "★" + C.RESET if sym in wl else " "
 
             tf_cells = "  ".join(
-                _rjust(SIG_CELL.get(as_dict(entry.get(tf)).get("signal", "NONE"),
+                _rjust(SIG_CELL.get(str(as_dict(entry.get(tf)).get("signal", "NONE")),
                                     C.DIM + "--" + C.RESET), col_tf)
                 for tf in tf_show)
 
@@ -6400,7 +6714,10 @@ def gap_scanner_view(data):
     for sym, entry in data.items():
         e   = as_dict(entry.get("DAY"))
         gap = as_dict(e.get("gap"))
-        if not gap:
+        # Bug fix: a partial/legacy gap dict (missing gap_type, or a junk
+        # gap_pct) used to pass the `if not gap` screen and then KeyError /
+        # TypeError inside the bucket sort and the row formatter below.
+        if gap.get("gap_type") not in ("GAP_UP", "GAP_DOWN", "NO_GAP"):
             missing.append(sym)
             continue
         sig  = e.get("signal", "NONE")
@@ -6416,10 +6733,11 @@ def gap_scanner_view(data):
         input("  Press ENTER..."); return
 
     # Sort buckets: gap_up (biggest first), gap_down (biggest first), no_gap
+    # safe_float in the keys: gap_pct can hold a junk string in a legacy row.
     gap_ups   = sorted([g for g in gaps if g[1]["gap_type"] == "GAP_UP"],
-                        key=lambda x: x[1]["gap_pct"], reverse=True)
+                        key=lambda x: safe_float(x[1].get("gap_pct")), reverse=True)
     gap_downs = sorted([g for g in gaps if g[1]["gap_type"] == "GAP_DOWN"],
-                        key=lambda x: x[1]["gap_pct"])
+                        key=lambda x: safe_float(x[1].get("gap_pct")))
     no_gaps   = sorted([g for g in gaps if g[1]["gap_type"] == "NO_GAP"],
                         key=lambda x: x[0])
 
@@ -6439,8 +6757,8 @@ def gap_scanner_view(data):
 
     def _row(sym, gap, sig, rsi, cs, conf):
         gt     = gap["gap_type"]
-        pct    = gap["gap_pct"]
-        filled = gap["gap_filled"]
+        pct    = safe_float(gap.get("gap_pct"))
+        filled = bool(gap.get("gap_filled"))
         if   gt == "GAP_UP":   col = C.GREEN
         elif gt == "GAP_DOWN": col = C.RED
         else:                  col = C.DIM
@@ -6448,16 +6766,16 @@ def gap_scanner_view(data):
         type_str   = col + gt + C.RESET
         status_str = (C.YELLOW + C.BOLD + "FILLED" + C.RESET if filled else
                       col + "OPEN  " + C.RESET)
-        sig_s   = signal_color(sig) + SIGNAL_SHORT.get(sig,"--") + C.RESET
+        sig_s   = signal_color(sig) + SIGNAL_SHORT.get(str(sig),"--") + C.RESET
         rsi_col = (C.RED if rsi > 75 else C.GREEN if rsi > 55 else
                    C.YELLOW if rsi > 40 else C.RED)
         print("  " +
               _ljust(C.BOLD + sym + C.RESET, 12) + "  " +
               _rjust(pct_str,                  7) + "  " +
               _ljust(type_str,                10) + "  " +
-              _rjust("₹" + str(gap["prev_close"]),  9) + "  " +
-              _rjust("₹" + str(gap["today_open"]),  9) + "  " +
-              _rjust("₹" + str(gap["gap_rs"]),       7) + "  " +
+              _rjust("₹" + str(gap.get("prev_close", "—")),  9) + "  " +
+              _rjust("₹" + str(gap.get("today_open", "—")),  9) + "  " +
+              _rjust("₹" + str(gap.get("gap_rs", "—")),       7) + "  " +
               _ljust(status_str,               8) + "  " +
               _rjust(sig_s,                    4) + "  " +
               _rjust(rsi_col + str(rsi) + C.RESET, 5) + "  " +
@@ -6776,12 +7094,16 @@ def auto_schedule_scan(data, active_tfs):
                     # cycle — stop rather than hammering the API all day.
                     cprint("\n  ✗ AUTO-SCHEDULE STOPPED: " + str(exc),
                            C.RED, bold=True)
-                    save_data(data)
+                    if not save_data(data):
+                        cprint("  ✗ Partial save FAILED — nothing was written to "
+                               + DATA_FILE, C.RED)
                     input("Press ENTER to return to menu...")
                     return data
                 time.sleep(0.8)
 
-            save_data(data)
+            if not save_data(data):
+                cprint("  ✗ SAVE FAILED — cycle results were NOT written to "
+                       + DATA_FILE, C.RED, bold=True)
 
             # ── Cycle summary ─────────────────────────────────
             done_s = datetime.now(IST).strftime("%H:%M:%S")
@@ -6859,7 +7181,7 @@ def momentum_screener(data, tfs=None):
     rows = []
     for sym, entry in data.items():
         tf_key = _score_tf_key(entry, tfs)
-        e      = entry.get(tf_key, {})
+        e      = as_dict(entry.get(tf_key))   # corrupt rows may hold scalars
         sig    = e.get("signal", "NONE")
         price  = safe_float(e.get("price", 0))
         rsi    = safe_float(e.get("rsi",   50))
@@ -7006,7 +7328,7 @@ def momentum_screener(data, tfs=None):
 
         print("  " +
               _ljust(col + sym + C.RESET, 12) + "  " +
-              _ljust(col + (sig if sig != "NONE" else "—") + C.RESET, 9) + "  " +
+              _ljust(col + (str(sig) if sig != "NONE" else "—") + C.RESET, 9) + "  " +
               _rjust(mom_col + str(total_mom) + C.RESET, 4) + "  " +
               _rjust(adx_col + str(adx_v) + C.RESET, 5) + "  " +
               _rjust(str(rsi), 5) + "  " +
@@ -7045,7 +7367,7 @@ def trend_strength_view(data, tfs=None):
     rows = []
     for sym, entry in sorted(data.items()):
         tf_key = _score_tf_key(entry, tfs)
-        e      = entry.get(tf_key, {})
+        e      = as_dict(entry.get(tf_key))   # corrupt rows may hold scalars
         sig    = e.get("signal", "NONE")
         adx_v  = safe_float(e.get("adx",        0))
         pdi    = safe_float(e.get("plus_di",     0))
@@ -7101,7 +7423,7 @@ def trend_strength_view(data, tfs=None):
 
         print("  " +
               _ljust(col + sym + C.RESET, 12) + "  " +
-              _ljust(col + (sig if sig != "NONE" else "—") + C.RESET, 9) + "  " +
+              _ljust(col + (str(sig) if sig != "NONE" else "—") + C.RESET, 9) + "  " +
               _rjust(adx_col + str(adx_v) + C.RESET, 5) + "  " +
               _rjust(str(pdi), 5) + "  " +
               _rjust(str(mdi), 5) + "  " +
@@ -7131,12 +7453,25 @@ def select_db_file(silent=False):
     """
     global DB_FILE, DATA_FILE
 
-    # Collect & sort dated DB files (newest date first)
+    # Collect & sort dated DB files (newest date first).
+    # Bug fix: _DATE_DB_RE only checks the digit pattern, so a file like
+    # "31-02-2026.db" or "99-99-9999.db" (typo/renamed backup) passed the
+    # regex and strptime() raised ValueError — crashing the app at startup
+    # (silent=True) before a single screen was drawn.  Unparseable names are
+    # simply not valid dated backups, so skip them instead of dying.
+    def _parse_dated_db(f):
+        try:
+            return datetime.strptime(f[:-3], '%d-%m-%Y')
+        except ValueError:
+            return None
+
     dated = sorted(
-        [f for f in os.listdir('.') if _DATE_DB_RE.match(f)],
-        key=lambda f: datetime.strptime(f[:-3], '%d-%m-%Y'),
+        [(f, d) for f in os.listdir('.') if _DATE_DB_RE.match(f)
+         for d in [_parse_dated_db(f)] if d is not None],
+        key=lambda t: t[1],
         reverse=True
     )
+    dated = [f for f, _d in dated]
 
     if not dated:
         # Bug fix: only show the warning when called interactively from the
@@ -7254,7 +7589,10 @@ def main_menu_loop(data, tfs):
         # ══════════════════════════════════════════════════════
         mkt_status = (C.GREEN + "● MARKET OPEN" if is_market_open()
                       else C.RED + "● MARKET CLOSED") + C.RESET
-        cprint("  MENU" + "  " * 28 + mkt_status, C.WHITE, bold=True)
+        # Pad must keep the line inside W (74): "  MENU" + pad + "● MARKET
+        # CLOSED" = 77 cols with the old 28-wide pad, which wrapped the header
+        # in a W-wide terminal and pushed the divider onto its tail.
+        cprint("  MENU" + "  " * 26 + mkt_status, C.WHITE, bold=True)
         div("─", W)
 
         print("  " + C.CYAN + C.BOLD + "── SCAN ──────────────────────────────────────────────────────────" + C.RESET)
@@ -7397,17 +7735,19 @@ def main_menu_loop(data, tfs):
             found = False
             for sym, entry in sorted(data.items()):
                 tf_key = _score_tf_key(entry, ACTIVE_TFS)
-                e      = entry.get(tf_key, {})
+                e      = as_dict(entry.get(tf_key))   # corrupt rows may hold scalars
                 div_   = as_dict(e.get("rsi_divergence"))
                 if not any(div_.values()):
                     continue
                 found = True
                 sig   = e.get("signal", "NONE")
                 col   = signal_color(sig)
-                price = e.get("price", 0)
+                # Bug fix: raw price reached int() here — a legacy row holding
+                # "junk"/None raised ValueError and killed the whole menu loop.
+                price = safe_float(e.get("price", 0))
                 rsi   = e.get("rsi", 0)
                 print("  " + C.BOLD + _ljust(sym, 14) + C.RESET +
-                      col + "{:<10}".format(sig) + C.RESET +
+                      col + "{:<10}".format(str(sig)) + C.RESET +
                       "  ₹{:<8}  RSI:{:<5}  ".format(int(price) if price else 0, rsi) +
                       (C.GREEN + "Reg.Bull▲ " + C.RESET if div_.get("regular_bull") else "") +
                       (C.GREEN + "Hid.Bull▲ " + C.RESET if div_.get("hidden_bull")  else "") +

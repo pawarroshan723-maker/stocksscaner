@@ -566,3 +566,45 @@ def test_weak_risk_reward_is_a_caution_on_both_sides(mod):
             (sig, s["cautions"])
         assert not s["buy_reasons"] or "risk:reward" not in \
             " ".join(s["buy_reasons"]).lower()
+
+
+def test_breakdown_caps_follow_the_documented_roles(mod):
+    """Targets must use max_t_atr and stops must use max_sl_atr — on BOTH
+    sides of the market.
+
+    Regression: the caps were applied per SIDE (support→SL cap,
+    resistance→target cap), which coincides with the documented roles only
+    for a BREAKOUT.  On a BREAKDOWN the roles swap — the stop is a
+    resistance and the targets are supports — so a short got a 6×ATR stop
+    (DAY promises ≤4×ATR) while its targets were cut off at 4×ATR (DAY
+    promises ≤8×ATR).
+    """
+    df = _with_level(_with_level(_flat_df(), "res", 6.0), "sup", 6.0)
+
+    t = mod.get_price_targets(df, "BREAKDOWN", "DAY")
+    assert t, "levels should qualify"
+    # stop = nearest resistance within max_sl_atr(4)×ATR → none qualify at
+    # 6×ATR → the documented close+1×ATR fallback must fire
+    assert t["stop"] <= CLOSE + 4.0 * ATR + 1e-9, \
+        "BREAKDOWN stop exceeds the documented 4×ATR cap: %r" % (t["stop"],)
+    # target = nearest support within max_t_atr(8)×ATR → the 6×ATR swing
+    # must be used instead of being wrongly rejected by the 4×ATR cap
+    assert abs(t["target1"] - (CLOSE - 6.0 * ATR)) < 1e-6, \
+        "6×ATR support should qualify under the 8×ATR target cap: %r" % (t["target1"],)
+
+    # Mirror: on a long, the 6×ATR support must NOT be usable as a stop
+    b = mod.get_price_targets(df, "BREAKOUT", "DAY")
+    assert b
+    assert b["stop"] >= CLOSE - 4.0 * ATR - 1e-9, \
+        "BREAKOUT stop exceeds the documented 4×ATR cap: %r" % (b["stop"],)
+    assert abs(b["target1"] - (CLOSE + 6.0 * ATR)) < 1e-6, \
+        "6×ATR resistance should qualify under the 8×ATR target cap: %r" % (b["target1"],)
+
+
+def test_breakdown_stop_within_sl_cap_still_uses_the_level(mod):
+    """A resistance inside the SL cap remains the stop (behaviour that was
+    already correct must not regress into a blind ATR fallback)."""
+    df = _with_level(_flat_df(), "res", 2.0)
+    t = mod.get_price_targets(df, "BREAKDOWN", "DAY")
+    assert t
+    assert abs(t["stop"] - (CLOSE + 2.0 * ATR)) < 1e-6, t["stop"]

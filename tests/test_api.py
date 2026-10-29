@@ -588,3 +588,23 @@ def test_cache_gap_detector_excludes_known_holidays_from_runs(mod):
     got = mod._cache_missing_days(pd.DataFrame({"ts": pd.to_datetime(pruned)}),
                                   start, end)
     assert known[0] not in got, "a known market closure was reported as a gap"
+
+
+def test_intraday_empty_message_matches_market_state(mod, api, monkeypatch,
+                                                     capsys):
+    """A 200-with-no-candles during market hours must not claim 'market
+    closed?' — at 10:00 AM that sent the user hunting for a closing-time
+    explanation that was simply false."""
+    # api.intraday = {} → FakeUpstox answers 200 with zero candles
+    monkeypatch.setattr(mod, "is_market_open", lambda: True)
+    mod.fetch_intraday_v3(KEY, "minutes", "5", {}, verbose=True)
+    out = capsys.readouterr().out
+    assert "No intraday candles" in out
+    assert "market closed" not in out, \
+        "told the user the market is closed during market hours"
+    assert "OPEN" in out, "open-market message must say the market is OPEN"
+
+    monkeypatch.setattr(mod, "is_market_open", lambda: False)
+    mod.fetch_intraday_v3(KEY, "minutes", "5", {}, verbose=True)
+    out = capsys.readouterr().out
+    assert "market closed" in out, "after hours the original wording must stay"

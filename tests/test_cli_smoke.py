@@ -235,3 +235,69 @@ def test_db_picker_out_of_range_keeps_current(mod, monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda *a: "99")
     mod.select_db_file(silent=False)
     assert mod.DB_FILE == "01-09-2026.db"
+
+
+def test_divergence_screen_survives_junk_price_and_corrupt_row(mod, wired_menu):
+    """Menu option D formatted int(price) raw and read entry[tf_key]
+    without coercion — 'junk' price or a scalar TF row killed the loop."""
+    first = sorted(wired_menu)[0]
+    e = mod.empty_entry()
+    e.update({"price": "junk", "signal": "BREAKOUT",
+              "rsi_divergence": {"regular_bull": True}})
+    wired_menu[first]["DAY"] = e
+    wired_menu[first]["WEEK"] = "totally-corrupt"
+    out = _walk(mod, wired_menu, ["D", "0"])
+    assert "Traceback" not in out
+
+
+def test_menu_status_line_fits_terminal_width(mod, scanned):
+    """Regression: the MENU header was 77 visible cols ("  MENU" + 28 pads +
+    "● MARKET CLOSED") against W=74 — it wrapped in a W-wide terminal and the
+    divider line visually attached to its tail."""
+    data, _ = scanned
+    out = _walk(mod, data, ["0"])
+    menu_lines = [ln for ln in out.splitlines()
+                  if "MENU" in ln and "MARKET" in ln]
+    assert menu_lines, "menu status line not rendered"
+    for ln in menu_lines:
+        assert mod._vlen(ln) <= mod.W, \
+            "menu status line is {} cols (W={}): {!r}".format(
+                mod._vlen(ln), mod.W, ln)
+
+
+def test_scan_tf_headers_pluralise_singular_units(mod, scanned):
+    """Regression: TF headers concatenated the fixed plural unit from
+    TF_CONFIG, printing "1HR (1 hours, 90d lookback)" and
+    "DAY (1 days, 2500d lookback)".  Singular intervals must read
+    "1 hour" / "1 day"; plural ones ("5 minutes") stay as they are."""
+    data, log = scanned
+    assert "1 hours" not in log, "singular 'hours' printed in scan log"
+    assert "1 days" not in log, "singular 'days' printed in scan log"
+    assert "(1 hour, 90d lookback)" in log
+    assert "(1 day, 2500d lookback)" in log
+    assert "(5 minutes, 30d lookback)" in log   # plural unchanged
+
+
+def test_individual_scan_reports_save_failure(mod, monkeypatch, capsys):
+    """'✓ Done. Saved to <db>' was printed unconditionally — a scan whose
+    every write died with 'no such table: scan_data' still claimed it had
+    persisted.  The success line must be gated on save_data()."""
+    api = FakeUpstox(daily=make_daily_series(n=400, seed=5))
+    api.intraday = {("days", "1"): make_daily_series(n=2, seed=5).tail(1)}
+    monkeypatch.setattr(mod, "requests", api)
+    syms = list(mod.SYMBOL_MAP.keys())[:3]
+    monkeypatch.setattr(mod, "SYMBOL_MAP", {k: mod.SYMBOL_MAP[k] for k in syms})
+    sym_name = next(iter(mod.SYMBOL_MAP.values()))
+
+    answers = iter([sym_name, "DAY", "n"])   # symbol, TF override, no detail
+    monkeypatch.setattr(mod, "input",
+                        lambda prompt="": next(answers, ""), raising=False)
+    monkeypatch.setattr(mod, "save_data", lambda data: False)
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        mod.scan_single_symbol({}, ["DAY"])
+    text = out.getvalue()
+    assert "SAVE FAILED" in text, "failed save not reported:\n" + text
+    assert "✓ Done. Saved" not in text, \
+        "success announced despite save_data() returning False:\n" + text
