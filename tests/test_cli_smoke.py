@@ -263,3 +263,16 @@ def test_menu_status_line_fits_terminal_width(mod, scanned):
         assert mod._vlen(ln) <= mod.W, \
             "menu status line is {} cols (W={}): {!r}".format(
                 mod._vlen(ln), mod.W, ln)
+
+
+def test_scan_tf_headers_pluralise_singular_units(mod, scanned):
+    """Regression: TF headers concatenated the fixed plural unit from
+    TF_CONFIG, printing "1HR (1 hours, 90d lookback)" and
+    "DAY (1 days, 2500d lookback)".  Singular intervals must read
+    "1 hour" / "1 day"; plural ones ("5 minutes") stay as they are."""
+    data, log = scanned
+    assert "1 hours" not in log, "singular 'hours' printed in scan log"
+    assert "1 days" not in log, "singular 'days' printed in scan log"
+    assert "(1 hour, 90d lookback)" in log
+    assert "(1 day, 2500d lookback)" in log
+    assert "(5 minutes, 30d lookback)" in log   # plural unchanged

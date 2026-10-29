@@ -3473,9 +3473,12 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
             continue
 
         unit, value, lookback = TF_CONFIG[tf]
+        # The unit strings in TF_CONFIG are fixed plurals ("hours", "days"),
+        # which printed "1HR (1 hours, 90d lookback)" / "DAY (1 days, ...)".
+        unit_lbl = unit[:-1] if value == "1" and unit.endswith("s") else unit
         resample_tag = (" (daily→" + RESAMPLE_TFS[tf] + ")"
                         if tf in RESAMPLE_TFS else
-                        " (" + value + " " + unit + ", " + str(lookback) + "d lookback)")
+                        " (" + value + " " + unit_lbl + ", " + str(lookback) + "d lookback)")
         print("    " + C.YELLOW + tf + C.RESET + resample_tag)
 
         df = fetch_candles(inst_key, unit, value, lookback, hdrs, verbose=True, tf_name=tf)
