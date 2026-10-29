@@ -152,3 +152,43 @@ def test_gap_confluence_label_counts_breakouts_and_breakdowns(mod):
     assert label == "Confluence: Mixed: 2 BREAKOUT / 1 BREAKDOWN", label
     # Weighting itself must be unchanged: net(+1) * 6 = +6.
     assert pts == 6
+
+
+# ── 6. trade plan must side with the verdict ────────────────
+def test_trade_plan_direction_matches_verdict(mod, capsys, monkeypatch):
+    """A BUY verdict must not be paired with a BREAKDOWN trade plan.
+
+    view_detail picked the single highest composite score regardless of
+    direction: a MONTH BREAKDOWN at 80 beat the DAY BREAKOUT at 60, so the
+    plan recommended the SHORT (T1 below entry) while the summary printed
+    VERDICT: BUY with long targets — opposite sides on one screen.
+    """
+    import builtins
+    monkeypatch.setattr(builtins, "input", lambda *a, **k: "")
+    day = {
+        "price": 100.0, "signal": "BREAKOUT", "composite_score": 60.0,
+        "risk_reward": 2.3, "rsi": 62.0, "rel_vol": 1.5, "atr": 2.0,
+        "day_high": 101.0, "day_low": 95.0, "candle_date": "2026-10-29",
+        "ema_alignment": "BULLISH STACK", "st_direction": 1,
+        "targets": {"target1": 110.0, "target2": 116.0, "stop": 95.0},
+    }
+    month = {
+        "price": 100.0, "signal": "BREAKDOWN", "composite_score": 80.0,
+        "risk_reward": 1.4, "rsi": 42.0, "rel_vol": 1.6, "atr": 14.0,
+        "day_high": 101.0, "day_low": 95.0, "candle_date": "2026-10",
+        "ema_alignment": "BEARISH STACK", "st_direction": -1,
+        "targets": {"target1": 80.0, "target2": 70.0, "stop": 115.0},
+    }
+    mod.view_detail("PLAUDIT", {"PLAUDIT": {"DAY": day, "MONTH": month}})
+    import re
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+
+    v = re.search(r"VERDICT:\s+(\w+)", out)
+    assert v, "verdict line missing"
+    assert v.group(1) == "BUY"          # primary DAY breakout → BUY
+    b = re.search(r"Best Setup\s*:\s*(?:[↑↓]\s*)?(BREAKOUT|BREAKDOWN)\s+on\s+(\w+)", out)
+    assert b, "best-setup line missing"
+    # Plan must side with the verdict, not the lone higher-scored counter-trend TF.
+    assert b.group(1) == "BREAKOUT", f"plan recommends {b.group(1)} under a BUY verdict"
+    assert b.group(2) == "DAY"
+    assert "opposite side" not in out   # fallback warning not needed here

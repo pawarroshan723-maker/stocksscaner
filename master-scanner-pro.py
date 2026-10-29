@@ -4344,14 +4344,33 @@ def view_detail(sym, data):
     # ══ 6. TRADE PLAN ════════════════════════════════════════════
     cprint("  TRADE PLAN RECOMMENDATION", C.WHITE, bold=True)
     div("─")
-    # Find best TF setup (highest scoring breakout or breakdown)
-    best_tf = None; best_score = -1
-    for tf in tf_order:
-        e   = as_dict(sym_data[tf])
-        sig = e.get("signal","NONE")
-        cs  = safe_float(e.get("composite_score",0))
-        if sig in ("BREAKOUT","BREAKDOWN") and cs > best_score:
-            best_score = cs; best_tf = tf
+    # Verdict FIRST: the recommended setup must agree with the STOCK SUMMARY
+    # printed immediately below. This used to pick the single highest
+    # composite score regardless of direction, so a screen with five
+    # BREAKOUT timeframes and one slightly higher-scoring MONTH BREAKDOWN
+    # recommended the SHORT (T1 far below entry) while the verdict said BUY
+    # with long targets — two opposite recommendations on one screen.
+    s       = generate_stock_summary(sym, sym_data, conf_tfs)
+    verdict = s["verdict"]
+    prefer  = ("BREAKOUT"   if verdict == "BUY" else
+               "BREAKDOWN"  if verdict == "SELL" else None)
+    # Best TF setup: highest composite score among setups that side WITH the
+    # verdict. If none exists (verdict from a NONE/SIDEWAYS primary), widen
+    # to any setup and flag the clash instead of silently contradicting it.
+    best_tf = None; best_score = -1; plan_conflict = False
+    for want in ((prefer, None) if prefer else (None,)):
+        for tf in tf_order:
+            e   = as_dict(sym_data[tf])
+            sig = e.get("signal","NONE")
+            cs  = safe_float(e.get("composite_score",0))
+            if (sig in ("BREAKOUT","BREAKDOWN")
+                    and (want is None or sig == want)
+                    and cs > best_score):
+                best_score = cs; best_tf = tf
+        if best_tf is not None:
+            break
+        if want is not None:
+            plan_conflict = True   # nothing in the verdict's direction
     if best_tf:
         be   = sym_data[best_tf]
         bsig = be.get("signal","NONE")
@@ -4360,6 +4379,10 @@ def view_detail(sym, data):
         print("  Best Setup    : " + bcol + C.BOLD + bsig + C.RESET +
               " on " + C.YELLOW + best_tf + C.RESET +
               "  Score: " + str(best_score) + "/100")
+        if plan_conflict:
+            cprint("  \u26a0 CONFLICT \u2014 no " + str(prefer) + " setup exists; this "
+                   "opposite-side setup is NOT what the VERDICT below calls for.",
+                   C.YELLOW)
         if btgt:
             print("  Entry         : " + C.CYAN + "₹" + str(be.get("price","—")) + C.RESET)
             print("  Target 1      : " + C.GREEN + "₹" + str(btgt.get("target1","—")) + C.RESET)
@@ -4386,7 +4409,8 @@ def view_detail(sym, data):
     print()
 
     # ══ 7. STOCK SUMMARY  (Buy / Sell reasons) ═══════════════════
-    s      = generate_stock_summary(sym, sym_data, conf_tfs)
+    # s (and its verdict) already computed above — the trade plan shows
+    # the same verdict's direction, so recompute nothing here.
     verdict    = s["verdict"]
     confidence = s["confidence"]
     v_col  = (C.GREEN  if verdict == "BUY"  else
