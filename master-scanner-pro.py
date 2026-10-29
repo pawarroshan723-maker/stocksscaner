@@ -824,7 +824,17 @@ def fetch_intraday_v3(instrument_key, v3_unit, v3_interval, headers, verbose=Tru
                 candles = as_list(as_dict(r.json().get("data")).get("candles"))
                 if candles:
                     return _parse_candle_df(candles)
-                if verbose: print("    No intraday candles returned (market closed?).")
+                if verbose:
+                    # Don't blame "market closed?" when the clock says
+                    # otherwise — a 200-with-no-candles during market hours
+                    # (feed empty/lagging) misleads the user at e.g. 10:00 AM.
+                    if is_market_open():
+                        print("    \u26a0 No intraday candles returned although the market is "
+                              "OPEN \u2014 Upstox's intraday feed is empty right now; "
+                              "today's session bars are missing from this TF "
+                              "(retry after data settles).")
+                    else:
+                        print("    No intraday candles returned (market closed?).")
                 return pd.DataFrame()
             if r.status_code in (401, 403):
                 raise TokenError(
