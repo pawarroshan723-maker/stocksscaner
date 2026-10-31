@@ -4415,9 +4415,10 @@ def view_detail(sym, data):
         print("  │  Signal      : " + col + C.BOLD + SIGNAL_LABEL.get(str(sig), "—") + C.RESET +
               C.DIM + "  [" + str(e.get("reason") or "—") + "]" + C.RESET)
         ref_text = "₹" + str(e.get("price")) if ref_ok else "—"
+        atr_pct_text = _display_number(e, "atr_pct", 0)
         print("  │  Price/ATR   : " + ref_text +
               "  ATR: " + ("₹" + _display_number(e, "atr", 0) if _display_number(e, "atr", 0) != "unavailable" else "unavailable") +
-              "  ATR%: " + _display_number(e, "atr_pct", 0))
+              "  ATR%: " + (atr_pct_text + "%" if atr_pct_text != "unavailable" else atr_pct_text))
         vol_text = _display_number(e, "volume", 0, 100)
         relvol_text = _display_number(e, "rel_vol", 0)
         print("  │  Vol score   : " + ("[" + bar(e["volume"], color=C.BLUE) + "] " + vol_text + "/100" if vol_text != "unavailable" else "unavailable") +
@@ -4499,9 +4500,12 @@ def view_detail(sym, data):
                   "  T2=₹" + str(tgt.get("target2","—")) + C.RESET +
                   "  " + C.RED + "SL=₹" + str(tgt.get("stop","—")) + C.RESET)
             sources = as_dict(e.get("target_sources"))
-            print("  │  Level source: T1=" + str(sources.get("target1", "unknown")) +
-                  "  T2=" + str(sources.get("target2", "unknown")) +
-                  "  SL=" + str(sources.get("stop", "unknown")))
+            if not sources:
+                print("  │  Level source: not recorded in this snapshot; rescan this TF.")
+            else:
+                print("  │  Level source: T1=" + str(sources.get("target1") or "not recorded") +
+                      "  T2=" + str(sources.get("target2") or "not recorded") +
+                      "  SL=" + str(sources.get("stop") or "not recorded"))
         elif tgt:
             print("  │  Ref levels  : unavailable without a valid reference price")
 

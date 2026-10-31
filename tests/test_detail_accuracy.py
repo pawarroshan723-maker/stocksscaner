@@ -70,4 +70,38 @@ def test_detail_missing_indicators_and_unscanned_not_fabricated(mod, capsys, mon
     assert "RSI(14)     : unavailable" in out
     assert "Ref R:R: unavailable" in out
     assert "Rule-based score, not a probability" in out
-    assert "Level source: T1=unknown" in out
+    assert "Level source: not recorded in this snapshot; rescan this TF." in out
+
+
+def test_new_scan_records_and_persists_level_sources(mod, monkeypatch):
+    df = make_ohlcv(n=300)
+    monkeypatch.setattr(mod, "fetch_candles", lambda *a, **k: df.copy())
+    monkeypatch.setattr(mod, "load_note", lambda *a: "")
+    # Ensure a directional signal so reference levels are generated.
+    original_detect = mod.detect_signal
+    def directional(frame, tf):
+        _, atr_pct, vol, oi, reason, components, extra = original_detect(frame, tf)
+        return "BREAKOUT", atr_pct, vol, oi, reason, components, extra
+    monkeypatch.setattr(mod, "detect_signal", directional)
+    data = {"TEST": {}}
+    mod._scan_one_symbol("key", "TEST", data, ["DAY"], {})
+    entry = data["TEST"]["DAY"]
+    assert entry["targets"]
+    assert set(entry["target_sources"]) == {"target1", "target2", "stop"}
+    assert mod.save_data(data)
+    assert mod.load_data()["TEST"]["DAY"]["target_sources"] == entry["target_sources"]
+
+
+def test_atr_percentage_has_unit_only_when_available(mod, capsys, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    entry = mod.empty_entry()
+    entry.update(signal="BREAKDOWN", price=2502.6, atr=4.7, atr_pct=0.2,
+                 updated="2026-10-31 17:50")
+    mod.view_detail("TEST", {"TEST": {"5MIN": entry}})
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert "ATR%: 0.2%" in out
+    entry["atr_pct"] = None
+    mod.view_detail("TEST", {"TEST": {"5MIN": entry}})
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert "ATR%: unavailable" in out
+    assert "ATR%: unavailable%" not in out
