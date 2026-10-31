@@ -245,3 +245,15 @@ def test_scanned_without_direction_explains_no_entries(mod, monkeypatch, tmp_pat
 @pytest.mark.parametrize("bad", [None, [], "junk", 42])
 def test_primary_timeframe_handles_corrupt_symbol_data(mod, bad):
     assert mod._score_tf_key(bad, ["DAY"]) == "DAY"
+
+
+def test_detail_shows_shared_note_once_not_in_each_timeframe(mod, monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    data = {"TEST": {"5MIN": _entry(mod, "BREAKDOWN"), "DAY": _entry(mod)}}
+    mod.view_detail("TEST", data)
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert out.count("not monitored live") == 1
+    assert "completed 5MIN candle closes below ₹98.00" in out
+    assert "completed DAY candle closes above ₹102.00" in out
+    assert "  │    Snapshot only" not in out
+    assert "  │    Reference levels and R:R" not in out

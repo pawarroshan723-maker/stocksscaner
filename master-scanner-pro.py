@@ -4287,6 +4287,14 @@ def view_detail(sym, data):
 
     # ══ 4. PER-TF DETAIL BLOCKS ══════════════════════════════════
     cprint("  TIMEFRAME ANALYSIS", C.WHITE, bold=True)
+    if any(str(sym_data[tf].get("signal", "NONE")) in ("BREAKOUT", "BREAKDOWN", "SIDEWAYS")
+           or (str(sym_data[tf].get("signal", "NONE")) == "NONE" and is_scanned_entry(sym_data[tf]))
+           for tf in tf_order):
+        cprint("  Entries are price-only snapshots, not monitored live or guaranteed fills.", C.DIM)
+        cprint("  Check a full candle after the scan; later scans recalculate levels.", C.DIM)
+        cprint("  Pullbacks are same-candle touches, not proof of a prior breakout.", C.DIM)
+        cprint("  Reference levels use the stored close (possibly unfinished), not a fill;", C.DIM)
+        cprint("  recheck the signal and recalculate targets, stop and R:R after a fill.", C.DIM)
     print()
     for tf in tf_order:
         e   = as_dict(sym_data[tf])
@@ -4373,11 +4381,6 @@ def view_detail(sym, data):
                 print("  │    " + setup["label"] + ":")
                 for line in textwrap.wrap(setup["when"], width=max(W - 9, 30)):
                     print("  │      " + line)
-            for line in textwrap.wrap(ENTRY_CONDITION_NOTE, width=max(W - 9, 30)):
-                print("  │    " + line)
-            if tgt and ref_ok:
-                print("  │    Reference levels and R:R use the latest stored candle close,")
-                print("  │    which may be unfinished; they are not entry-specific estimates.")
 
         cps = as_list(e.get("candle_patterns"))
         if cps:
@@ -7912,9 +7915,9 @@ def main_menu_loop(data, tfs):
         print("  J  Gap Scanner         Today open vs yesterday close — gap up/down")
         print("  Y  Volume Profile      HVN / LVN / POC chart for any symbol + TF")
         print("  U  Auto-Schedule       Repeat scans on a timer (Ctrl+C to stop)")
-        print("  Q  Next Day Gap ★      Predict tomorrow's gap-up/down before open")
-        print("  3  Momentum Screener ★ Rank by ADX+RSI+MFI+Williams%%R momentum score")
-        print("  4  Trend Strength      ADX | +DI/-DI | Williams%%R | MFI | CCI table")
+        print("  Q  Next Day Gap ★      Estimate next-day gap bias from DAY data")
+        print("  3  Momentum Screener ★ Rank by momentum score (ADX, RSI, MFI & more)")
+        print("  4  Trend Strength      ADX | +DI/-DI | Williams %R | MFI | CCI table")
         div("─", W)
 
         print("  " + C.CYAN + C.BOLD + "── HISTORY & WATCHLIST ───────────────────────────────────────────" + C.RESET)
@@ -7927,9 +7930,9 @@ def main_menu_loop(data, tfs):
         print("  A  Add symbol          Add a custom NSE symbol & instrument key")
         print("  R  Remove symbol       Remove a custom symbol from the list")
         print("  N  Edit note           Attach a personal note to any symbol / TF")
-        print("  E  Export TXT          Save formatted report  → master_report.txt")
-        print("  Z  Export CSV          Save machine-readable data → master_export.csv")
-        print("  P  Export HTML ★       Full visual browser report → master_report.html")
+        print("  E  Export TXT          Save report → master_report_<timestamp>.txt")
+        print("  Z  Export CSV          Save data → master_export_<timestamp>.csv")
+        print("  P  Export HTML ★       Save report → master_report_<timestamp>.html")
         print("  ~  Change DB File      Switch to a different dated backup DB")
         div("─", W)
 
