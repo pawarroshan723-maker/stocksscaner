@@ -257,3 +257,18 @@ def test_detail_shows_shared_note_once_not_in_each_timeframe(mod, monkeypatch, t
     assert "completed DAY candle closes above ₹102.00" in out
     assert "  │    Snapshot only" not in out
     assert "  │    Reference levels and R:R" not in out
+
+
+def test_detail_labels_volume_candle_and_fibonacci_accurately(mod, monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    e = _entry(mod, volume=100, rel_vol=7.49, fibonacci={
+        "sw_high": 2527.7, "sw_low": 2502.4,
+        "fib_38.2": 2518.04, "fib_50": 2515.05, "fib_61.8": 2512.06,
+    })
+    mod.view_detail("TEST", {"TEST": {"5MIN": e}})
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert "100.0/100  RelVol: 7.49x" in out
+    assert "rolling 20-candle average, including this candle" in out
+    assert "Candle time : 2026-10-29 15:15  (completion/freshness unverified)" in out
+    assert "retracements measured down from swing high" in out
+    assert "Ref R:R:" in out
