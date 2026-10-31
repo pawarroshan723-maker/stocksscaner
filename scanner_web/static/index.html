@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101d1a">
+  <title>Stocks Scanner · Workspace</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 1 4 17.5z"/><path d="M4 17.5A2.5 2.5 0 0 1 6.5 15H20M8 7h8M8 10h7"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 17v3h14v-3"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6 .9-4.4 4.3 1 6.1-5.3-2.9-5.4 2.9 1-6.1-4.4-4.3 6-.9z"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 9a7 7 0 0 1 12-2l2 5M4 12l2 5a7 7 0 0 0 12-2"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M5 5l14 14M19 5 5 19"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 7-8M15 7h5v5"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 5 3 8 7 10 4-2 7-5 7-10V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+</svg>
+<div class="app-shell">
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="#overview" aria-label="Stocks Scanner home"><span class="brand-mark"><span></span><span></span><span></span><span></span></span><span><strong>stocks<span>scanner</span></strong><small>MARKET WORKSPACE</small></span></a>
+    <div class="side-section-label">WORKSPACE</div>
+    <nav class="side-nav" aria-label="Main navigation">
+      <a class="nav-link active" href="#overview"><svg><use href="#i-grid"/></svg>Overview <span class="nav-dot"></span></a>
+      <a class="nav-link" href="#results"><svg><use href="#i-list"/></svg>Scan results</a>
+      <button class="nav-link" id="importNav" type="button"><svg><use href="#i-download"/></svg>Import old data</button>
+      <a class="nav-link" href="/api/download-app" download="stockscanner-dashboard.zip"><svg><use href="#i-download"/></svg>Download app</a>
+      <button class="nav-link" id="guideButton" type="button"><svg><use href="#i-book"/></svg>How it works</button>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="side-note"><div class="side-note-icon"><svg><use href="#i-shield"/></svg></div><strong>Clarity before action.</strong><p>Signals are conditions, not orders. Always review your risk.</p></div>
+      <div class="side-version"><span class="version-dot"></span> CORE WORKSPACE <span>v1.0</span></div>
+    </div>
+  </aside>
+  <div class="side-overlay" id="sideOverlay"></div>
+  <main class="main" id="overview">
+    <header class="topbar">
+      <div class="topbar-left"><button class="icon-button menu-toggle" id="menuToggle" aria-label="Open navigation"><svg><use href="#i-menu"/></svg></button><span class="breadcrumb">Workspace <span>/</span> <strong>Overview</strong></span></div>
+      <div class="topbar-right"><span class="top-status"><span></span> SNAPSHOT VIEW</span><label class="source-select"><span class="sr-only">Data source</span><select id="sourceSelect"><option value="demo">Demo data</option><option value="real">My snapshots</option></select></label><button class="icon-button" id="refreshButton" title="Refresh snapshot list" aria-label="Refresh snapshot list"><svg><use href="#i-refresh"/></svg></button></div>
+    </header>
+    <div class="content">
+      <div class="page-head"><div><div class="eyebrow"><span class="eyebrow-line"></span> YOUR SCANNER WORKSPACE</div><h1>A clearer view of the market<span>.</span></h1><p>Explore your scans, understand the setup, and plan with context.</p></div><div class="page-actions"><a class="button button-outline" href="/api/download-app" download="stockscanner-dashboard.zip"><svg><use href="#i-download"/></svg> Download app</a><button class="button button-primary" id="scanButton"><svg><use href="#i-plus"/></svg> Run a scan</button></div></div>
+      <div class="source-banner demo-banner" id="sourceBanner"><div class="banner-icon"><svg><use href="#i-info"/></svg></div><div><strong id="bannerTitle">You’re exploring demo data</strong><span id="bannerText">These prices are fictional examples, not live market data.</span></div><button class="text-link" id="bannerAction">Use my data <svg><use href="#i-arrow"/></svg></button></div>
+      <section class="stats" aria-label="Scan overview">
+        <div class="stat-card"><div class="stat-top"><span>Snapshots</span><span class="stat-icon neutral"><svg><use href="#i-grid"/></svg></span></div><div class="stat-number" id="statTotal">—</div><div class="stat-foot">In selected timeframe</div></div>
+        <div class="stat-card"><div class="stat-top"><span>Bullish</span><span class="stat-icon green">↗</span></div><div class="stat-number" id="statBull">—</div><div class="stat-foot"><span class="stat-dot green-bg"></span>Breakout signals</div></div>
+        <div class="stat-card"><div class="stat-top"><span>Bearish</span><span class="stat-icon red">↘</span></div><div class="stat-number" id="statBear">—</div><div class="stat-foot"><span class="stat-dot red-bg"></span>Breakdown signals</div></div>
+        <div class="stat-card"><div class="stat-top"><span>Sideways</span><span class="stat-icon amber"><svg><use href="#i-star"/></svg></span></div><div class="stat-number" id="statSide">—</div><div class="stat-foot"><span class="stat-dot amber-bg"></span>Sideways / no signal</div></div>
+      </section>
+      <div class="workspace-grid">
+        <div class="workspace-main">
+          <section class="panel chart-panel" aria-labelledby="chartTitle">
+            <div class="panel-heading"><div><div class="section-kicker">PRICE CONTEXT <span class="kicker-dot">·</span> <span id="chartMode">DEMO</span></div><h2 id="chartTitle">Select a snapshot</h2><p id="chartMeta">A historical snapshot, not a live quote.</p></div><div class="chart-actions"><button class="favorite-button" id="favoriteButton" aria-label="Add to watchlist" title="Add to watchlist"><svg><use href="#i-star"/></svg></button><button class="button button-outline" id="exportButton"><svg><use href="#i-download"/></svg> Export</button></div></div>
+            <div class="chart-summary"><div><span class="price-label">LATEST STORED CLOSE</span><div class="chart-price" id="chartPrice">—</div></div><div class="chart-signal" id="chartSignal">—</div></div>
+            <div class="chart-wrap"><svg id="priceChart" viewBox="0 0 700 205" role="img" aria-label="Stored price history"></svg><div class="chart-empty" id="chartEmpty" hidden>Price history isn’t available for this snapshot.</div></div>
+            <div class="chart-footer"><span id="chartStart">—</span><span id="chartFoot">Latest stored candles · not live</span><span id="chartEnd">—</span></div>
+          </section>
+          <section class="panel results-panel" id="results" aria-labelledby="resultsTitle">
+            <div class="results-head"><div><div class="section-kicker">YOUR UNIVERSE</div><h2 id="resultsTitle">Scan results <span id="resultCount" class="count-pill">0</span></h2><p>Choose a stock to explore its conditions.</p></div><div class="results-controls"><label class="search-box"><svg><use href="#i-search"/></svg><span class="sr-only">Search symbols</span><input id="searchInput" type="search" placeholder="Search symbol" autocomplete="off"></label><label class="filter-select"><span class="sr-only">Filter signals</span><select id="signalFilter"><option value="ALL">All signals</option><option value="BREAKOUT">Bullish</option><option value="BREAKDOWN">Bearish</option><option value="SIDEWAYS">Sideways</option><option value="FAVORITES">Watchlist</option></select></label></div></div>
+            <div class="timeframe-row"><span>TIMEFRAME</span><div class="timeframes" id="timeframes" role="group" aria-label="Timeframe"><button data-tf="5MIN">5m</button><button data-tf="15MIN">15m</button><button data-tf="1HR">1h</button><button data-tf="DAY" class="selected">1D</button><button data-tf="WEEK">1W</button><button data-tf="MONTH">1M</button></div><span class="table-hint">Each timeframe is a separate snapshot</span></div>
+            <div class="table-scroll"><table><thead><tr><th>SYMBOL</th><th>STORED CLOSE</th><th>SIGNAL</th><th>SCORE</th><th>RSI</th><th>REF R:R</th><th><span class="sr-only">Watchlist</span></th></tr></thead><tbody id="resultsBody"></tbody></table></div>
+            <div class="table-empty" id="tableEmpty" hidden><div class="empty-icon"><svg><use href="#i-search"/></svg></div><strong>No snapshots to show</strong><p id="emptyText">Try a different search or timeframe.</p><button class="button button-outline" id="importButton" hidden>Import legacy data</button></div>
+            <div class="table-footer"><span id="tableFooter">—</span><span>Click a row to inspect <span aria-hidden="true">↗</span></span></div>
+          </section>
+        </div>
+        <aside class="panel inspector" aria-label="Selected setup details">
+          <div class="inspector-heading"><div><div class="section-kicker">THE DETAILS</div><h2>Setup overview</h2></div><span class="inspector-icon"><svg><use href="#i-trend"/></svg></span></div>
+          <div id="detailContent">
+            <div class="detail-symbol-row"><div class="symbol-logo" id="detailLogo">—</div><div class="detail-name"><strong id="detailSymbol">Select a stock</strong><span id="detailSector">—</span></div><span class="signal-badge" id="detailSignal">—</span></div>
+            <div class="signal-reason"><span>SIGNAL BASIS</span><p id="signalReason">—</p></div>
+            <div class="detail-divider"></div>
+            <div class="detail-section-head"><span>CONDITIONAL ENTRIES</span><span id="detailTf">—</span></div>
+            <p class="detail-intro">Price-only checks on a full candle starting after the scan time; no extra volume filter.</p>
+            <div class="setup-card" id="breakoutCard"><div class="setup-top"><span class="setup-num">01</span><strong id="breakoutLabel">Breakout / breakdown</strong></div><div class="setup-price" id="breakoutLevel">—</div><p id="breakoutWhen">Select a snapshot to view the condition.</p></div>
+            <div class="setup-card" id="pullbackCard"><div class="setup-top"><span class="setup-num secondary">02</span><strong id="pullbackLabel">Pullback / retest</strong></div><div class="setup-price" id="pullbackLevel">—</div><p id="pullbackWhen">Select a snapshot to view the condition.</p></div>
+            <div class="risk-head"><span>REFERENCE LEVELS</span><span class="risk-help">AT STORED CLOSE</span></div>
+            <div class="risk-grid"><div><span>Target 1</span><strong id="targetOne">—</strong></div><div><span>Target 2</span><strong id="targetTwo">—</strong></div><div><span>Stop</span><strong id="targetStop">—</strong></div><div><span>Ref R:R</span><strong id="riskReward">—</strong></div></div>
+            <div class="detail-note"><svg><use href="#i-info"/></svg><p>Snapshot only; not monitored live. A trigger is not a fill. Recheck your signal, stop, targets and R:R at the actual fill. A new scan recalculates levels.</p></div>
+            <div class="detail-timestamps"><span>Candle <strong id="candleDate">—</strong></span><span>Scanned <strong id="scanDate">—</strong></span></div>
+          </div>
+        </aside>
+      </div>
+      <footer class="footer"><span>Stocks Scanner · Core workspace</span><span>For education and research only. Not financial advice.</span></footer>
+    </div>
+  </main>
+</div>
+<dialog id="scanDialog" class="dialog"><div class="dialog-head"><div><div class="section-kicker">NEW SNAPSHOT</div><h2>Run a scan</h2></div><button class="icon-button" data-close="scanDialog" aria-label="Close"><svg><use href="#i-close"/></svg></button></div><p>Scan one symbol or the configured universe in a single timeframe. Provider or cached candles may be stale.</p><div class="connection-note" id="connectionNote">Checking provider configuration…</div><form id="scanForm"><label>Symbol<select id="scanSymbol" required></select></label><label>Timeframe<select id="scanTf"><option value="5MIN">5 minutes</option><option value="15MIN">15 minutes</option><option value="1HR">1 hour</option><option value="DAY" selected>Daily</option><option value="WEEK">Weekly</option><option value="MONTH">Monthly</option></select></label><div class="dialog-actions"><button type="button" class="button button-ghost" data-close="scanDialog">Cancel</button><button type="submit" class="button button-primary" id="submitScan">Start scan <svg><use href="#i-arrow"/></svg></button></div></form></dialog>
+<dialog id="guideDialog" class="dialog guide"><div class="dialog-head"><div><div class="section-kicker">A QUICK GUIDE</div><h2>Read the workspace</h2></div><button class="icon-button" data-close="guideDialog" aria-label="Close"><svg><use href="#i-close"/></svg></button></div><div class="guide-content"><h3>1. Snapshot, not a live quote</h3><p>Prices are stored candle closes. The latest candle can be unfinished, and provider or cached data may be stale. Check its candle date and scan time.</p><h3>2. Two conditional entries</h3><p>A bullish breakout requires a completed candle to close above the nearest resistance. A bullish pullback requires a touch of support and a close back above it in the same candle. Bearish conditions are mirrored.</p><h3>3. Reference is not a fill</h3><p>Use a full candle starting after the scan time. These price-only rules are not monitored; a later scan replaces the levels. A fill may differ or never occur. Recalculate the stop, targets and R:R for any actual fill.</p><h3>Connect and import</h3><p>Configure the existing local Upstox token or <code>UPSTOX_ACCESS_TOKEN</code> environment variable to scan. Existing <code>master_scanner.db</code> snapshots can be imported without changing the original file.</p></div><div class="dialog-actions"><button class="button button-primary" data-close="guideDialog">Got it</button></div></dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

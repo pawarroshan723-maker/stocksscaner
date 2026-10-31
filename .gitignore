@@ -16,3 +16,9 @@ master_export_*.csv
 scanner_data.db
 scanner_data_*.db
 upstox_token.json
+
+# Web app data and legacy scanner databases are local/private
+.scanner-web/
+master_scanner*.db
+master_scanner*.db-wal
+master_scanner*.db-shm

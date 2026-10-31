@@ -42,6 +42,7 @@ import sys
 import time
 import math
 import sqlite3
+import textwrap
 from datetime import datetime, timedelta, date
 from urllib.parse import quote
 import pytz
@@ -1408,6 +1409,15 @@ def safe_float(val, default=0.0):
         return default if math.isnan(v) else v
     except Exception:
         return default
+
+
+def _valid_reference_price(value):
+    """A usable quoted price must be finite and strictly positive."""
+    if isinstance(value, bool):
+        return False
+    price = safe_float(value, float("nan"))
+    return math.isfinite(price) and price > 0
+
 
 def calc_rsi(series, period=14):
     """
@@ -2863,6 +2873,103 @@ def get_price_targets(df, signal, tf="DAY"):
     return {}
 
 
+# These are snapshot-based *conditions*, not orders or prices at which a
+# trade is known to have executed. Keep the warning the same in every view.
+ENTRY_CONDITION_NOTE = (
+    "Entry checks use price only, with no extra volume filter. "
+    "Snapshot only — not monitored live. "
+    "Check a full candle starting after "
+    "the scan time on your chart; it may already have occurred. A later scan "
+    "recalculates levels instead of tracking these thresholds. Pullback here "
+    "means a same-candle support touch and reclaim or resistance touch and "
+    "rejection, not proof of an earlier breakout. A trigger is not a fill: an "
+    "actual fill may differ or not occur. Recheck the signal and recalculate "
+    "targets, stop and R:R using the actual fill."
+)
+
+
+def get_conditional_entries(entry, tf):
+    """Describe two possible price-action conditions from a scan snapshot.
+
+    For a bullish signal use the nearest resistance for a close-above
+    breakout, or the nearest support for a same-candle touch-and-bounce.
+    For a bearish signal use the nearest support for a close-below breakdown,
+    or the nearest resistance for a same-candle touch-and-rejection. Levels
+    must be on the correct side of the stored reference close. A missing or
+    invalid level is unavailable, never manufactured from ATR or a target.
+
+    The rules concern a complete candle starting after the scan time; this
+    function does not check historical bars, monitor the market, predict the
+    confirmation time, calculate a fill, or assign targets to the conditions.
+    """
+    entry = as_dict(entry)
+    signal = str(entry.get("signal") or "")
+    direction = {"BREAKOUT": "BULLISH", "BREAKDOWN": "BEARISH"}.get(signal)
+    breakout_label = ("Breakout (bullish)" if direction == "BULLISH" else
+                      "Breakdown (bearish)" if direction == "BEARISH" else
+                      "Breakout / breakdown")
+    pullback_label = ("Pullback / retest (bullish)" if direction == "BULLISH" else
+                      "Pullback / retest (bearish)" if direction == "BEARISH" else
+                      "Pullback / retest")
+
+    def unavailable(message):
+        return {"direction": direction,
+                "breakout": {"label": breakout_label, "level": None, "when": message},
+                "pullback": {"label": pullback_label, "level": None, "when": message}}
+
+    if not direction:
+        return unavailable("Unavailable: no directional breakout/breakdown signal.")
+
+    def price_value(value):
+        if not _valid_reference_price(value):
+            return None
+        value = round(safe_float(value), 2)  # stored/displayed S/R uses paise
+        return value if value > 0 else None
+
+    price = price_value(entry.get("price"))
+    if price is None:
+        return unavailable("Unavailable: no valid reference price; rescan this timeframe.")
+    updated = entry.get("updated")
+    try:
+        if not isinstance(updated, str):
+            raise ValueError("missing scan time")
+        datetime.strptime(updated.strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return unavailable("Unavailable: scan time is missing or invalid; rescan this timeframe.")
+
+    supports = [p for p in map(price_value, as_list(entry.get("support")))
+                if p is not None and p < price]
+    resistances = [p for p in map(price_value, as_list(entry.get("resistance")))
+                   if p is not None and p > price]
+    support = max(supports) if supports else None
+    resistance = min(resistances) if resistances else None
+    no_support = "Unavailable: No support below the reference price in this scan."
+    no_resistance = "Unavailable: No resistance above the reference price in this scan."
+    candle = "A completed " + str(tf) + " candle "
+
+    def rupees(level):
+        return "₹{:,.2f}".format(level)
+
+    if direction == "BULLISH":
+        breakout_level, pullback_level = resistance, support
+        breakout_when = (candle + "closes above " + rupees(resistance) + "."
+                         if resistance is not None else no_resistance)
+        pullback_when = (candle + "trades at or below " + rupees(support) +
+                         " and closes above " + rupees(support) + "."
+                         if support is not None else no_support)
+    else:
+        breakout_level, pullback_level = support, resistance
+        breakout_when = (candle + "closes below " + rupees(support) + "."
+                         if support is not None else no_support)
+        pullback_when = (candle + "trades at or above " + rupees(resistance) +
+                         " and closes below " + rupees(resistance) + "."
+                         if resistance is not None else no_resistance)
+
+    return {"direction": direction,
+            "breakout": {"label": breakout_label, "level": breakout_level, "when": breakout_when},
+            "pullback": {"label": pullback_label, "level": pullback_level, "when": pullback_when}}
+
+
 def _floor_price(level, close):
     """Keep a computed price level strictly positive.
 
@@ -3932,9 +4039,11 @@ def _score_tf_key(entry, tfs):
     Priority: DAY → WEEK → MONTH → 1HR → 15MIN → 5MIN → first dict-valued
     key in tfs → first key in tfs.
     """
+    entry = as_dict(entry)
     preferred = ["DAY", "WEEK", "MONTH", "1HR", "15MIN", "5MIN"]
     for tf in preferred:
-        if tf in entry and safe_float(as_dict(entry[tf]).get("price", 0)):
+        raw_price = as_dict(entry.get(tf)).get("price", 0)
+        if _valid_reference_price(raw_price):
             return tf
     # Fallback: first tf in tfs that exists in entry AND holds a dict
     for tf in tfs:
@@ -4183,11 +4292,13 @@ def view_detail(sym, data):
         e   = as_dict(sym_data[tf])
         sig = e.get("signal", "NONE")
         col = signal_color(sig)
+        ref_ok = _valid_reference_price(e.get("price"))
 
         print(col + C.BOLD + "  ┌── " + tf + " " + "─" * (W - 8 - len(tf)) + C.RESET)
         print("  │  Signal      : " + col + C.BOLD + SIGNAL_LABEL.get(str(sig), "—") + C.RESET +
               C.DIM + "  [" + str(e.get("reason") or "—") + "]" + C.RESET)
-        print("  │  Price/ATR   : ₹" + str(e.get("price","—")) +
+        ref_text = "₹" + str(e.get("price")) if ref_ok else "—"
+        print("  │  Price/ATR   : " + ref_text +
               "  ATR: ₹" + str(e.get("atr","—")) +
               "  ATR%: " + str(e.get("atr_pct",0)) + "%")
         print("  │  Volume      : [" + bar(e.get("volume",0), color=C.BLUE) + "] " +
@@ -4234,15 +4345,18 @@ def view_detail(sym, data):
         rr = safe_float(e.get("risk_reward", 0))
         sc_col = C.GREEN if cs >= 65 else (C.YELLOW if cs >= 40 else C.DIM)
         rr_col = C.GREEN if rr >= 2  else (C.YELLOW if rr >= 1.5 else C.RED)
+        rr_text = str(rr) + ":1" if ref_ok and math.isfinite(rr) else "—"
         print("  │  Comp.Score  : " + sc_col + str(cs) + "/100" + C.RESET +
-              "  R:R: " + rr_col + str(rr) + ":1" + C.RESET)
+              "  Ref R:R: " + rr_col + rr_text + C.RESET)
 
         tgt = as_dict(e.get("targets"))
-        if tgt:
-            print("  │  Targets     : " + C.GREEN +
+        if tgt and ref_ok:
+            print("  │  Ref levels  : " + C.GREEN +
                   "T1=₹" + str(tgt.get("target1","—")) +
                   "  T2=₹" + str(tgt.get("target2","—")) + C.RESET +
                   "  " + C.RED + "SL=₹" + str(tgt.get("stop","—")) + C.RESET)
+        elif tgt:
+            print("  │  Ref levels  : unavailable without a valid reference price")
 
         supp = as_list(e.get("support"))
         res  = as_list(e.get("resistance"))
@@ -4250,6 +4364,20 @@ def view_detail(sym, data):
                        "  ".join("₹" + str(s) for s in supp) + C.RESET)
         if res:  print("  │  Resistance  : " + C.RED +
                        "  ".join("₹" + str(r) for r in res)  + C.RESET)
+
+        if (str(sig) in ("BREAKOUT", "BREAKDOWN", "SIDEWAYS") or
+                (str(sig) == "NONE" and is_scanned_entry(e))):
+            setups = get_conditional_entries(e, tf)
+            print("  │  Conditional entries — scan: " + str(e.get("updated") or "unavailable") + " IST")
+            for setup in (setups["breakout"], setups["pullback"]):
+                print("  │    " + setup["label"] + ":")
+                for line in textwrap.wrap(setup["when"], width=max(W - 9, 30)):
+                    print("  │      " + line)
+            for line in textwrap.wrap(ENTRY_CONDITION_NOTE, width=max(W - 9, 30)):
+                print("  │    " + line)
+            if tgt and ref_ok:
+                print("  │    Reference levels and R:R use the latest stored candle close,")
+                print("  │    which may be unfinished; they are not entry-specific estimates.")
 
         cps = as_list(e.get("candle_patterns"))
         if cps:
@@ -4267,10 +4395,10 @@ def view_detail(sym, data):
         if divs: print("  │  RSI Div     : " + "  ".join(divs))
 
         if e.get("retest_bo"):
-            print("  │  " + C.GREEN + C.BOLD + "★ RETEST BREAKOUT  R1=₹" +
+            print("  │  " + C.GREEN + C.BOLD + "★ RETEST BREAKOUT (scan indicator) R1=₹" +
                   str(e.get("retest_bo_level",0)) + C.RESET)
         if e.get("retest_bd"):
-            print("  │  " + C.RED + C.BOLD + "★ RETEST BREAKDOWN S1=₹" +
+            print("  │  " + C.RED + C.BOLD + "★ RETEST BREAKDOWN (scan indicator) S1=₹" +
                   str(e.get("retest_bd_level",0)) + C.RESET)
 
         fib = as_dict(e.get("fibonacci"))
@@ -4342,7 +4470,7 @@ def view_detail(sym, data):
         print()
 
     # ══ 6. TRADE PLAN ════════════════════════════════════════════
-    cprint("  TRADE PLAN RECOMMENDATION", C.WHITE, bold=True)
+    cprint("  REFERENCE TRADE PLAN (not an executed entry)", C.WHITE, bold=True)
     div("─")
     # Verdict FIRST: the recommended setup must agree with the STOCK SUMMARY
     # printed immediately below. This used to pick the single highest
@@ -4383,17 +4511,21 @@ def view_detail(sym, data):
             cprint("  \u26a0 CONFLICT \u2014 no " + str(prefer) + " setup exists; this "
                    "opposite-side setup is NOT what the VERDICT below calls for.",
                    C.YELLOW)
-        if btgt:
-            print("  Entry         : " + C.CYAN + "₹" + str(be.get("price","—")) + C.RESET)
+        if btgt and _valid_reference_price(be.get("price")):
+            print("  Reference price: " + C.CYAN + "₹" + str(be.get("price","—")) + C.RESET)
             print("  Target 1      : " + C.GREEN + "₹" + str(btgt.get("target1","—")) + C.RESET)
             print("  Target 2      : " + C.GREEN + "₹" + str(btgt.get("target2","—")) + C.RESET)
             print("  Stop Loss     : " + C.RED   + "₹" + str(btgt.get("stop","—"))    + C.RESET)
             rr  = safe_float(be.get("risk_reward",0))
             rrc = C.GREEN if rr >= 2 else (C.YELLOW if rr >= 1.5 else C.RED)
-            print("  Risk:Reward   : " + rrc + str(rr) + ":1" + C.RESET)
+            print("  Ref Risk:Reward: " + rrc + str(rr) + ":1" + C.RESET)
+            cprint("  Levels assume the stored close, not a confirmed entry; see "
+                   "conditional entries above.", C.DIM)
+        elif btgt:
+            cprint("  Reference levels unavailable without a valid reference price.", C.YELLOW)
         # Next day context
         print("  Tomorrow bias : " + gb_col + C.BOLD + gb_str + C.RESET +
-              "  (" + str(gap_score) + "% probability)")
+              "  (gap-up bias score " + str(gap_score) + "/100; not a probability)")
         if bsig == "BREAKOUT" and gap_bias == "GAP_UP":
             cprint("  ✓ ALIGNED — Breakout signal + Gap-Up bias = high conviction setup", C.GREEN, bold=True)
         elif bsig == "BREAKDOWN" and gap_bias == "GAP_DOWN":
@@ -4470,18 +4602,21 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     sell_reasons = []
     cautions     = []
 
-    # ── Pick primary TF (DAY preferred, else first available) ─
-    pri_tf  = "DAY" if "DAY" in sym_data else next(
-        (tf for tf in TF_CONFIG if tf in sym_data), None)
+    # Prefer DAY only when it has price data; empty DAY placeholders must not
+    # hide the signal from a scanned intraday or longer timeframe.
+    pri_tf  = _score_tf_key(sym_data, tfs)
     # Bug fix: sym_data[pri_tf] may be a corrupt non-dict JSON scalar —
     # as_dict guarantees the .get chain below never raises.
     e       = as_dict(sym_data.get(pri_tf)) if pri_tf else {}
-    price   = safe_float(e.get("price",  0))
+    raw_price = e.get("price", 0)
+    price   = safe_float(raw_price) if _valid_reference_price(raw_price) else 0.0
     sig     = e.get("signal",         "NONE")
     rsi     = safe_float(e.get("rsi",  50))
     rv      = safe_float(e.get("rel_vol", 1))
     cs      = safe_float(e.get("composite_score", 0))
     rr      = safe_float(e.get("risk_reward", 0))
+    if not price or not math.isfinite(rr):
+        rr = 0.0  # A reference R:R cannot be assessed without a valid close.
     # str(): a legacy row can hold a non-str here; `in ema_aln` would raise
     # TypeError: argument of type 'int' is not iterable.
     ema_aln = str(e.get("ema_alignment", "") or "")
@@ -4497,37 +4632,26 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     # ── SIGNAL ────────────────────────────────────────────────
     if sig == "BREAKOUT":
         buy_reasons.append(
-            "Price has broken out on the " + (pri_tf or "DAY") +
-            " chart — momentum is pointing upward")
+            "Scanner reports a bullish BREAKOUT signal on the " + (pri_tf or "DAY") +
+            " chart — this is not confirmation of a later entry condition")
         if e.get("retest_bo"):
             lvl = e.get("retest_bo_level", "")
             buy_reasons.append(
-                "RETEST BREAKOUT confirmed: resistance ₹" + str(lvl) +
-                " was tested twice and held as new support — very high conviction")
+                "Bullish retest indicator in this scan at ₹" + str(lvl) +
+                " — separate from the conditional entry rules")
     elif sig == "BREAKDOWN":
         sell_reasons.append(
-            "Price has broken down on the " + (pri_tf or "DAY") +
-            " chart — momentum is pointing downward")
+            "Scanner reports a bearish BREAKDOWN signal on the " + (pri_tf or "DAY") +
+            " chart — this is not confirmation of a later entry condition")
         if e.get("retest_bd"):
             lvl = e.get("retest_bd_level", "")
             sell_reasons.append(
-                "RETEST BREAKDOWN confirmed: support ₹" + str(lvl) +
-                " failed twice — sellers are in control")
+                "Bearish retest indicator in this scan at ₹" + str(lvl) +
+                " — separate from the conditional entry rules")
     elif sig == "SIDEWAYS":
         cautions.append("Price is consolidating — no directional edge yet; wait for a breakout or breakdown")
     else:
         cautions.append("No clear signal on " + (pri_tf or "DAY") + " timeframe")
-
-    # Bug fix: the old `conf >= max(2, len(tfs) - 1)` fired on ALL-but-one
-    # agreement and still printed "ALL N active timeframes agree" — with 3 TFs
-    # a single SIDEWAYS/NONE timeframe produced a false "ALL 3" claim.  conf
-    # can only equal ±len(tfs) when every timeframe actually voted the same
-    # way (SIDEWAYS/NONE contribute 0), so claim ALL only then.  Partial
-    # alignment is already reported by the multi-TF block below.
-    if len(tfs) >= 2 and conf >= len(tfs):
-        buy_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bullish")
-    elif len(tfs) >= 2 and conf <= -len(tfs):
-        sell_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bearish")
 
     # ── MULTI-TF CONFLUENCE ───────────────────────────────────
     bo_tfs = [tf for tf in tfs
@@ -4535,19 +4659,29 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     bd_tfs = [tf for tf in tfs
               if as_dict(sym_data.get(tf)).get("signal") == "BREAKDOWN"]
 
-    if len(bo_tfs) >= 2:
+    # Unanimity is one piece of evidence, not two separate reasons. For a
+    # split vote, report each qualifying side independently and always warn
+    # about opposition; an elif used to hide bearish votes whenever there
+    # were two bullish votes (and even claimed agreement "at all horizons").
+    if len(tfs) >= 2 and conf == len(tfs):
+        buy_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bullish")
+    elif len(bo_tfs) >= 2:
         buy_reasons.append(
             "Bullish signal aligns across multiple timeframes (" +
-            ", ".join(bo_tfs) + ") — trend is consistent at all horizons")
+            ", ".join(bo_tfs) + ") — alignment on the listed timeframes")
+
+    if len(tfs) >= 2 and conf == -len(tfs):
+        sell_reasons.append("ALL " + str(len(tfs)) + " active timeframes agree bearish")
     elif len(bd_tfs) >= 2:
         sell_reasons.append(
             "Bearish signal aligns across multiple timeframes (" +
-            ", ".join(bd_tfs) + ") — downtrend is confirmed at all horizons")
-    elif bo_tfs and bd_tfs:
+            ", ".join(bd_tfs) + ") — alignment on the listed timeframes")
+
+    if bo_tfs and bd_tfs:
         cautions.append(
             "Mixed signals: bullish on " + ", ".join(bo_tfs) +
             " but bearish on " + ", ".join(bd_tfs) +
-            " — conflicting timeframes reduce confidence")
+            " — direction differs across timeframes")
 
     # ── RSI ───────────────────────────────────────────────────
     if rsi >= 70:
@@ -4654,10 +4788,16 @@ def generate_stock_summary(sym, sym_data, tfs=None):
         cautions.append(
             "Volume is only " + str(round(rv, 1)) + "x average — "
             "low conviction; breakout/breakdown may be a false move")
-    elif rv >= 1.5:
+    elif rv >= 1.5 and sig == "BREAKOUT":
         buy_reasons.append(
-            "Above-average volume (" + str(round(rv, 1)) + "x) confirms "
-            "genuine interest in the current move")
+            "Above-average volume (" + str(round(rv, 1)) + "x) supports the breakout")
+    elif rv >= 1.5 and sig == "BREAKDOWN":
+        sell_reasons.append(
+            "Above-average volume (" + str(round(rv, 1)) + "x) supports the breakdown")
+    elif rv >= 1.5:
+        cautions.append(
+            "Above-average volume (" + str(round(rv, 1)) + "x) without a "
+            "directional signal — check price action")
 
     # ── CANDLESTICK PATTERNS ──────────────────────────────────
     bull_cp = [p for p in cps if p in CANDLE_BULL]
@@ -4722,11 +4862,17 @@ def generate_stock_summary(sym, sym_data, tfs=None):
 
     # ── 52-WEEK HIGH / LOW ────────────────────────────────────
     if w52:
-        ph = safe_float(w52.get("pct_from_high", 0))
-        pl = safe_float(w52.get("pct_from_low",  0))
-        h52 = w52.get("high_52w", "—")
-        l52 = w52.get("low_52w",  "—")
-        if ph >= -3:
+        # A partial/old 52W record is not evidence of a 0% distance. Only
+        # describe a level when both its numeric price and percentage exist.
+        ph = safe_float(w52.get("pct_from_high"), float("nan"))
+        pl = safe_float(w52.get("pct_from_low"), float("nan"))
+        h52 = w52.get("high_52w")
+        l52 = w52.get("low_52w")
+        h52_num = safe_float(h52, float("nan"))
+        l52_num = safe_float(l52, float("nan"))
+        has_high = math.isfinite(ph) and math.isfinite(h52_num) and h52_num > 0
+        has_low = math.isfinite(pl) and math.isfinite(l52_num) and l52_num > 0 and pl >= 0
+        if has_high and ph >= -3:
             if sig == "BREAKOUT":
                 buy_reasons.append(
                     "Price is within " + str(abs(ph)) + "% of its 52-week high (₹" +
@@ -4737,7 +4883,7 @@ def generate_stock_summary(sym, sym_data, tfs=None):
                     "Price is near its 52-week high (₹" + str(h52) +
                     ") — strong resistance zone; "
                     "sellers often appear at year-highs")
-        elif pl <= 10:
+        elif has_low and pl <= 10:
             if sig == "BREAKDOWN":
                 sell_reasons.append(
                     "Price is only " + str(abs(pl)) + "% above its 52-week low (₹" +
@@ -4748,7 +4894,7 @@ def generate_stock_summary(sym, sym_data, tfs=None):
                     "Price is near its 52-week low (₹" + str(l52) +
                     ") — deeply discounted; a reversal here would offer "
                     "an excellent risk:reward for patient buyers")
-        elif pl >= 50:
+        elif has_low and pl >= 50:
             buy_reasons.append(
                 "Price has recovered " + str(pl) + "% from its 52-week low — "
                 "strong trend recovery underway")
@@ -4762,24 +4908,14 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     # therefore added a spurious BUY argument to every short, inflating the
     # score and, in close cases, flipping the verdict to BUY outright.
     # The praise has to follow the direction of the trade.
-    if rr >= 2.5 and sig == "BREAKOUT":
-        buy_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — excellent setup; "
-            "you risk ₹1 to potentially make ₹" + str(rr))
-    elif rr >= 2.5 and sig == "BREAKDOWN":
-        sell_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — excellent short setup; "
-            "you risk ₹1 to potentially make ₹" + str(rr))
-    elif rr >= 1.5 and sig == "BREAKOUT":
-        buy_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — acceptable setup")
-    elif rr >= 1.5 and sig == "BREAKDOWN":
-        sell_reasons.append(
-            "Risk:Reward is " + str(rr) + ":1 — acceptable short setup")
+    if rr >= 1.5 and sig in ("BREAKOUT", "BREAKDOWN"):
+        reason = ("Reference Risk:Reward is " + str(rr) + ":1 at the latest "
+                  "stored candle close — recalculate for an actual fill")
+        (buy_reasons if sig == "BREAKOUT" else sell_reasons).append(reason)
     elif 0 < rr < 1.5 and sig in ("BREAKOUT", "BREAKDOWN"):
         cautions.append(
-            "Risk:Reward is only " + str(rr) + ":1 — "
-            "the potential gain does not justify the risk at this entry")
+            "Reference Risk:Reward is only " + str(rr) + ":1 at the latest "
+            "stored candle close — an actual fill may have a different ratio")
 
     # ── COMPOSITE SCORE ───────────────────────────────────────
     #
@@ -4820,18 +4956,13 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     if tgt and price:
         sl  = safe_float(tgt.get("stop", 0))
         t1  = safe_float(tgt.get("target1", 0))
-        if sl > 0 and sig == "BREAKOUT":
-            buy_reasons.append(
-                "Entry: ₹" + str(price) +
-                "  |  Stop Loss: ₹" + str(sl) +
-                "  |  Target 1: ₹" + str(t1) +
-                " — clear trade levels defined")
-        elif sl > 0 and sig == "BREAKDOWN":
-            sell_reasons.append(
-                "Short Entry: ₹" + str(price) +
-                "  |  Stop Loss: ₹" + str(sl) +
-                "  |  Target 1: ₹" + str(t1) +
-                " — clear trade levels defined")
+        if sl > 0 and sig in ("BREAKOUT", "BREAKDOWN"):
+            reference_levels = (
+                "Reference " + (pri_tf or "DAY") + " candle close: ₹" + str(price) +
+                "  |  Reference Stop: ₹" + str(sl) +
+                "  |  Reference Target 1: ₹" + str(t1) +
+                " — estimates, not an entry trigger")
+            (buy_reasons if sig == "BREAKOUT" else sell_reasons).append(reference_levels)
 
     # ── VERDICT ───────────────────────────────────────────────
     bull_pts = len(buy_reasons)
@@ -4884,25 +5015,21 @@ def generate_stock_summary(sym, sym_data, tfs=None):
     else:
         headline = (sym + " (" + sec + ") — no actionable setup; stay on the sidelines")
 
-    # Action sentence
+    # The stored price is only the latest candle close, not a filled entry.
+    # Verdicts are directional summaries; neither they nor the reference
+    # targets imply that a conditional setup has triggered.
     if verdict == "BUY":
-        if tgt:
-            action = ("Consider a LONG entry near ₹" + str(price) +
-                      " with stop below ₹" + str(tgt.get("stop","—")) +
-                      " and target ₹" + str(tgt.get("target1","—")) + ".")
-        else:
-            action = "Consider a LONG entry; use ATR or swing low as stop loss."
+        action = ("Bullish bias only. Review a completed-candle breakout or "
+                  "pullback condition when available; recalculate risk and targets "
+                  "using any actual fill.")
     elif verdict == "SELL":
-        if tgt:
-            action = ("Consider EXITING longs or a SHORT entry near ₹" + str(price) +
-                      " with stop above ₹" + str(tgt.get("stop","—")) +
-                      " and target ₹" + str(tgt.get("target1","—")) + ".")
-        else:
-            action = "Consider EXITING or shorting; use ATR or swing high as stop."
+        action = ("Bearish bias only. Review a completed-candle breakdown or "
+                  "retest condition when available; recalculate risk and targets "
+                  "using any actual fill.")
     elif verdict == "HOLD":
-        action = "Hold existing positions if you own it; do NOT initiate new trades."
+        action = "Wait for clearer direction and a completed-candle entry condition."
     else:
-        action = "No trade. Wait for a clear breakout or breakdown before risking capital."
+        action = "No clear setup. Wait for direction and a completed-candle entry condition."
 
     return {
         "verdict":      verdict,
@@ -5533,17 +5660,21 @@ def export_report(data, tfs=None):
             w52 = as_dict(e.get("52w"))
             div_= as_dict(e.get("rsi_divergence"))
             cps = as_list(e.get("candle_patterns"))
+            ref_ok = _valid_reference_price(e.get("price"))
+            rr_num = safe_float(e.get("risk_reward", 0), float("nan"))
+            rr_text = str(rr_num) + ":1" if ref_ok and math.isfinite(rr_num) else "—"
             lines += [
                 "  " + tf,
                 "    Signal       : " + str(e.get("signal") or "—"),
                 "    Reason       : " + str(e.get("reason") or "—"),
-                "    Price        : ₹" + str(e.get("price", "—")),
+                "    Reference price (latest candle close): " +
+                ("₹" + str(e.get("price")) if ref_ok else "—"),
                 "    Vol/ATR%     : " + str(e.get("volume", "—")) + "% / " + "{:.1f}".format(safe_float(e.get("atr_pct", 0))) + "%",
                 "    RSI          : " + str(e.get("rsi", "—")),
                 "    RelVol       : " + str(e.get("rel_vol", "—")),
                 "    Trend Str    : " + str(e.get("trend_strength", 0)),
                 "    Comp. Score  : " + str(e.get("composite_score", 0)) + "/100",
-                "    Risk:Reward  : " + str(e.get("risk_reward", 0)) + ":1",
+                "    Ref Risk:Reward: " + rr_text,
                 "    EMA Align    : " + str(e.get("ema_alignment", "—")),
                 "    MACD Cross   : " + str(e.get("macd_cross", "—")),
                 "    SuperTrend   : " + ("BULL" if e.get("st_direction") == 1 else
@@ -5565,16 +5696,31 @@ def export_report(data, tfs=None):
                     "    52W Low      : ₹{} ({:+.1f}%)".format(w52.get("low_52w","—"),  safe_float(w52.get("pct_from_low"),  0.0)),
                 ]
             tgt = as_dict(e.get("targets"))
-            if tgt:
+            if tgt and ref_ok:
                 lines += [
                     "    Target 1     : ₹" + str(tgt.get("target1", "—")),
                     "    Target 2     : ₹" + str(tgt.get("target2", "—")),
                     "    Stop Loss    : ₹" + str(tgt.get("stop", "—")),
                 ]
+            elif tgt:
+                lines.append("    Reference targets unavailable without a valid reference price.")
             supp = as_list(e.get("support"))
             res  = as_list(e.get("resistance"))
             if supp: lines.append("    Support      : " + ", ".join("₹" + str(s) for s in supp))
             if res:  lines.append("    Resistance   : " + ", ".join("₹" + str(r) for r in res))
+            if (str(e.get("signal")) in ("BREAKOUT", "BREAKDOWN", "SIDEWAYS") or
+                    (str(e.get("signal")) == "NONE" and is_scanned_entry(e))):
+                setups = get_conditional_entries(e, tf)
+                lines.append("    Conditional entries (candle: " +
+                             str(e.get("candle_date") or "unavailable") + "; scan: " +
+                             str(e.get("updated") or "unavailable") + " IST):")
+                for setup in (setups["breakout"], setups["pullback"]):
+                    lines.append("      " + setup["label"] + ": " + setup["when"])
+                lines.append("      " + ENTRY_CONDITION_NOTE)
+                if tgt and ref_ok:
+                    lines.append("      Reference targets, stop and R:R use the latest stored "
+                                 "candle close, which may be unfinished; they are not "
+                                 "entry-specific estimates.")
             if e.get("note"):
                 lines.append("    Note         : " + str(e["note"]))
             if e.get("signal_changed"):
@@ -5622,9 +5768,10 @@ def export_html(data, tfs=None):
     def fmt_p(v):
         try:
             f = float(v)
-            if f >= 10000: return "₹{:,.0f}".format(f)
-            if f >= 1000:  return "₹{:,.1f}".format(f)
-            return "₹{:.2f}".format(f)
+            # Prices and trade levels are stored to two decimal places. Do
+            # not discard paise for expensive stocks: an entry, target or
+            # stop could otherwise render as the same price.
+            return "₹{:,.2f}".format(f) if math.isfinite(f) else "—"
         # Non-numeric junk from a corrupt row must be escaped like every other
         # interpolated string — otherwise "<script>" in a price field lands
         # raw in the report.
@@ -5633,8 +5780,16 @@ def export_html(data, tfs=None):
     def safe(v, d=0.0):
         try:
             r = float(v)
-            return d if (r != r) else r
+            return r if math.isfinite(r) else d
         except Exception: return d
+
+    def has_price(entry):
+        return _valid_reference_price(as_dict(entry).get("price", 0))
+
+    def report_tf(entry):
+        # Match the scanner's primary-TF priority, but reject invalid prices.
+        return next((tf for tf in ("DAY", "WEEK", "MONTH", "1HR", "15MIN", "5MIN")
+                     if has_price(entry.get(tf))), _score_tf_key(entry, tfs))
 
     def esc(v):
         """HTML-escape interpolated text.
@@ -5647,6 +5802,11 @@ def export_html(data, tfs=None):
         return (str(v).replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace('"', "&quot;")
                 .replace("'", "&#39;"))
+
+    def symbol_fragment(sym):
+        # An HTML-escaped ID is not a URL-encoded fragment. In particular a
+        # literal "%20" in a custom name must not turn into a space on click.
+        return quote("sym-" + str(sym), safe="")
 
     # ── Pre-compute summary stats ─────────────────────────────
     bo_d = bd_d = sw_d = no_d = 0
@@ -5673,10 +5833,22 @@ def export_html(data, tfs=None):
         elif s == "SIDEWAYS": sectors[sec]["SW"] += 1
         else:                 sectors[sec]["N"]  += 1
 
-    # Sort all symbols by DAY composite score desc
+    # The DAY dashboard stays DAY-only. Detail cards also need scanned
+    # intraday/weekly-only symbols, otherwise all-TF links have no target and
+    # their conditional entry rules are inaccessible.
     ranked = sorted(
-        [(sym,e) for sym,e in data.items() if as_dict(e.get("DAY")).get("price",0)],
+        [(sym, e) for sym, e in data.items() if has_price(e.get("DAY"))],
         key=lambda x: safe(as_dict(x[1].get("DAY")).get("composite_score", 0)), reverse=True)
+    day_symbols = {sym for sym, _ in ranked}
+    other_details = [
+        (sym, e) for sym, e in data.items() if sym not in day_symbols
+        and any(has_price(e.get(tf)) or
+                str(as_dict(e.get(tf)).get("signal") or "NONE") != "NONE"
+                for tf in TF_CONFIG)
+    ]
+    other_details.sort(key=lambda x: safe(as_dict(x[1].get(report_tf(x[1])))
+                                         .get("composite_score", 0)), reverse=True)
+    detail_ranked = ranked + other_details
 
     # ── Build HTML ────────────────────────────────────────────
     H = []
@@ -5689,142 +5861,204 @@ def export_html(data, tfs=None):
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Master Scanner Report""" + " — " + gen + """</title>
 <style>
-:root{--bg:#0a0c0f;--s1:#111318;--s2:#181c23;--bd:#1e2330;
-  --gr:#00d68f;--grd:#00d68f22;--re:#ff4757;--red:#ff475720;
-  --ye:#ffd32a;--yed:#ffd32a18;--bl:#2ed8ff;--bld:#2ed8ff15;
-  --tx:#e8eaf0;--mu:#5a6278;--mono:'Courier New',monospace;--sans:system-ui,sans-serif}
+/* ── Master Scanner Pro — dashboard theme (v2: readable, hi-DPI sharp) ── */
+:root{
+  --bg:#0b0e15; --s1:#121724; --s2:#1a2133; --bd:#273047;
+  --gr:#25e6a0; --grd:rgba(37,230,160,.13); --re:#ff5c72; --red:rgba(255,92,114,.13);
+  --ye:#ffcb3d; --yed:rgba(255,203,61,.13); --bl:#3fd8ff; --bld:rgba(63,216,255,.13);
+  --tx:#eef1f8; --mu:#97a1bb;
+  --mono:"Cascadia Mono",Consolas,"SF Mono","Roboto Mono",Menlo,monospace;
+  --sans:"Segoe UI",Inter,-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",Arial,sans-serif;
+  --rad:10px; --sh:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.20);
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px}
+html{font-size:16px;scroll-behavior:smooth;scroll-padding-top:70px}
+body{
+  background:var(--bg);
+  background-image:
+    radial-gradient(1100px 520px at 12% -8%, rgba(63,216,255,.07), transparent 60%),
+    radial-gradient(900px 480px at 88% 0%, rgba(37,230,160,.06), transparent 55%);
+  background-attachment:fixed;
+  color:var(--tx);font-family:var(--sans);font-size:15px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  text-rendering:optimizeLegibility}
 a{color:var(--bl);text-decoration:none}
-/* LAYOUT */
-.wrap{max-width:1440px;margin:0 auto;padding:16px 20px}
-.hdr{background:var(--s1);border-bottom:1px solid var(--bd);padding:14px 20px;
-  display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100}
-.hdr-logo{font-family:var(--mono);font-size:11px;letter-spacing:.12em;color:var(--mu)}
+a:hover{text-decoration:underline}
+/* ── HEADER ── */
+.wrap{max-width:1400px;margin:0 auto;padding:22px 26px 10px}
+.hdr{background:rgba(18,23,36,.93);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--bd);padding:13px 26px;
+  display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+  position:sticky;top:0;z-index:100;box-shadow:0 2px 14px rgba(0,0,0,.35)}
+.hdr-logo{font-family:var(--mono);font-size:14.5px;letter-spacing:.05em;color:var(--tx);font-weight:600}
 .hdr-logo b{color:var(--gr)}
-.hdr-ts{font-family:var(--mono);font-size:10px;color:var(--mu)}
-/* CARDS ROW */
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
-.card{background:var(--s1);border:1px solid var(--bd);border-radius:6px;padding:14px;position:relative;overflow:hidden}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.card.gr::before{background:var(--gr)}.card.re::before{background:var(--re)}
-.card.ye::before{background:var(--ye)}.card.bl::before{background:var(--bl)}
-.card-lbl{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px}
-.card-val{font-family:var(--mono);font-size:30px;font-weight:700;line-height:1;margin-bottom:3px}
+.hdr-ts{font-family:var(--mono);font-size:12.5px;color:var(--mu)}
+/* ── STAT CARDS ── */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:14px;margin-bottom:18px}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.025),transparent 55%),var(--s1);
+  border:1px solid var(--bd);border-radius:var(--rad);padding:16px 18px;position:relative;
+  overflow:hidden;box-shadow:var(--sh);transition:transform .15s ease,box-shadow .15s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 10px rgba(0,0,0,.45),0 12px 28px rgba(0,0,0,.28)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.card.gr::before{background:linear-gradient(90deg,var(--gr),rgba(37,230,160,0))}
+.card.re::before{background:linear-gradient(90deg,var(--re),rgba(255,92,114,0))}
+.card.ye::before{background:linear-gradient(90deg,var(--ye),rgba(255,203,61,0))}
+.card.bl::before{background:linear-gradient(90deg,var(--bl),rgba(63,216,255,0))}
+.card-lbl{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--mu);margin-bottom:8px}
+.card-val{font-family:var(--mono);font-size:34px;font-weight:700;line-height:1.05;margin-bottom:4px}
 .card.gr .card-val{color:var(--gr)}.card.re .card-val{color:var(--re)}
 .card.ye .card-val{color:var(--ye)}.card.bl .card-val{color:var(--bl)}
-.card-sub{font-size:11px;color:var(--mu)}
-/* SECTION */
-.sec{background:var(--s1);border:1px solid var(--bd);border-radius:6px;padding:16px;margin-bottom:14px}
-.sec-title{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--mu);padding-bottom:8px;border-bottom:1px solid var(--bd);margin-bottom:12px;
-  display:flex;align-items:center;justify-content:space-between}
-.sec-title span{color:var(--tx)}
-/* GRID 2-col */
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
-.g3{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:14px}
-/* BADGES */
-.badge{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;
-  letter-spacing:.05em;padding:2px 6px;border-radius:3px}
-.badge.bo{background:var(--grd);color:var(--gr);border:1px solid #00d68f44}
-.badge.bd{background:var(--red);color:var(--re);border:1px solid #ff475740}
-.badge.sw{background:var(--yed);color:var(--ye);border:1px solid #ffd32a30}
+.card-sub{font-size:13px;color:var(--mu)}
+/* ── SECTIONS ── */
+.sec{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rad);
+  padding:18px 20px;margin-bottom:16px;box-shadow:var(--sh)}
+.sec-title{font-size:15px;font-weight:700;color:var(--tx);
+  padding-bottom:10px;border-bottom:1px solid var(--bd);margin-bottom:14px;
+  display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.sec-title span{color:var(--mu);font-size:12.5px;font-weight:500}
+/* ── GRIDS ── */
+.g2{display:grid;grid-template-columns:repeat(auto-fit,minmax(370px,1fr));gap:16px;margin-bottom:16px}
+.g3{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:16px}
+.g2 > *, .g3 > *{min-width:0}
+/* ── BADGES ── */
+.badge{display:inline-block;font-family:var(--mono);font-size:11.5px;font-weight:700;
+  letter-spacing:.03em;padding:3px 9px;border-radius:5px;white-space:nowrap}
+.badge.bo{background:var(--grd);color:var(--gr);border:1px solid rgba(37,230,160,.35)}
+.badge.bd{background:var(--red);color:var(--re);border:1px solid rgba(255,92,114,.35)}
+.badge.sw{background:var(--yed);color:var(--ye);border:1px solid rgba(255,203,61,.3)}
 .badge.none{background:var(--s2);color:var(--mu);border:1px solid var(--bd)}
-/* TF dots */
-.tfdots{display:flex;gap:3px}
-.tfd{width:20px;height:20px;border-radius:3px;font-family:var(--mono);font-size:7px;
+/* ── TF DOTS ── */
+.tfdots{display:flex;gap:5px;flex-wrap:wrap}
+.tfd{width:28px;height:28px;border-radius:6px;font-family:var(--mono);font-size:11px;
   font-weight:700;display:flex;align-items:center;justify-content:center}
 .tfd.bo{background:var(--grd);color:var(--gr)}.tfd.bd{background:var(--red);color:var(--re)}
 .tfd.sw{background:var(--yed);color:var(--ye)}.tfd.none{background:var(--s2);color:var(--mu)}
-/* TABLE */
-table{width:100%;border-collapse:collapse}
-th{font-family:var(--mono);font-size:9px;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--mu);text-align:left;padding:6px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}
-td{padding:6px 8px;border-bottom:1px solid #13161e;vertical-align:middle}
+/* ── TABLES ── */
+.table-scroll{overflow-x:auto;max-width:100%}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{font-family:var(--mono);font-size:12px;letter-spacing:.05em;text-transform:uppercase;
+  color:#8f99b5;text-align:left;padding:9px 12px;border-bottom:2px solid var(--bd);
+  white-space:nowrap;font-weight:700}
+td{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.055);vertical-align:middle;font-size:14px}
+tbody tr:nth-child(even){background:rgba(255,255,255,.015)}
 tr:hover td{background:var(--s2)}
 tr:last-child td{border-bottom:none}
-.sym{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--tx)}
-.sec-tag{font-size:9px;color:var(--mu);display:block}
-.mono{font-family:var(--mono);font-size:11px}
+.sym{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--tx)}
+.sec-tag{font-size:11.5px;color:var(--mu);display:block}
+.mono{font-family:var(--mono);font-size:13.5px}
 .gr{color:var(--gr)}.re{color:var(--re)}.ye{color:var(--ye)}.mu{color:var(--mu)}
-/* SCORE BAR */
-.sbar-wrap{width:55px}
-.sbar-num{font-family:var(--mono);font-size:10px;margin-bottom:2px}
-.sbar-bg{background:var(--s2);border-radius:2px;height:4px;overflow:hidden}
-.sbar-fill{height:4px;border-radius:2px}
-/* RSI PILL */
-.rsi-p{display:inline-block;font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:10px}
-.rsi-ob{background:#ff475718;color:var(--re)}.rsi-bull{background:var(--grd);color:var(--gr)}
+/* ── SCORE BAR ── */
+.sbar-wrap{width:64px}
+.sbar-num{font-family:var(--mono);font-size:13px;font-weight:600;margin-bottom:3px}
+.sbar-bg{background:rgba(255,255,255,.07);border-radius:3px;height:6px;overflow:hidden}
+.sbar-fill{height:6px;border-radius:3px}
+/* ── RSI PILL ── */
+.rsi-p{display:inline-block;font-family:var(--mono);font-size:12.5px;font-weight:600;
+  padding:2px 8px;border-radius:12px;min-width:40px;text-align:center}
+.rsi-ob{background:var(--red);color:var(--re)}.rsi-bull{background:var(--grd);color:var(--gr)}
 .rsi-mid{background:var(--yed);color:var(--ye)}.rsi-os{background:var(--bld);color:var(--bl)}
-/* SECTOR HEATMAP */
-.sec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
-.sec-cell{background:var(--s2);border:1px solid var(--bd);border-radius:4px;padding:10px}
-.sec-name{font-size:9px;font-weight:600;color:var(--mu);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
-.sec-bars{display:flex;gap:2px;height:22px;align-items:flex-end;margin-bottom:4px}
-.sec-bar{border-radius:2px 2px 0 0;flex:0 0 14px;min-height:2px}
-.sec-counts{display:flex;gap:6px;font-family:var(--mono);font-size:9px}
-/* DETAIL CARD */
-.det-card{background:var(--s1);border:1px solid var(--bd);border-radius:6px;
-  margin-bottom:12px;overflow:hidden}
-.det-hdr{padding:12px 16px;border-bottom:1px solid var(--bd);
-  display:flex;align-items:center;justify-content:space-between;
-  background:var(--s2)}
-.det-sym{font-family:var(--mono);font-size:16px;font-weight:700}
-.det-meta{font-size:11px;color:var(--mu)}
-.det-body{padding:14px 16px}
-/* TF BLOCK */
-.tf-block{border:1px solid var(--bd);border-radius:4px;margin-bottom:8px;overflow:hidden}
-.tf-block-hdr{padding:8px 12px;background:var(--s2);display:flex;align-items:center;gap:10px;
-  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:11px;font-weight:700}
-.tf-block-body{padding:10px 12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-.tf-kv{font-size:11px}
-.tf-kv-lbl{color:var(--mu);font-size:9px;margin-bottom:1px;text-transform:uppercase;letter-spacing:.06em}
-.tf-kv-val{font-family:var(--mono);font-size:11px}
-/* REASON TAG */
-.reason{font-size:10px;color:var(--mu);font-style:italic;padding:3px 0 6px;border-bottom:1px solid #13161e;margin-bottom:8px}
-/* TARGETS ROW */
-.tgt-row{display:flex;gap:12px;flex-wrap:wrap;padding:8px 0;border-top:1px solid #13161e;margin-top:6px}
-.tgt-box{background:var(--s2);border-radius:4px;padding:6px 10px;font-family:var(--mono);font-size:11px}
-.tgt-lbl{font-size:8px;color:var(--mu);display:block;margin-bottom:2px;text-transform:uppercase;letter-spacing:.08em}
-/* GAP PREDICTION */
-.gap-bar-wrap{background:var(--s2);border-radius:3px;height:8px;overflow:hidden;flex:1}
-.gap-bar-fill{height:8px;border-radius:3px}
-.gap-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-.gap-score{font-family:var(--mono);font-size:22px;font-weight:700;min-width:50px}
-.gap-bias{font-family:var(--mono);font-size:13px;font-weight:700}
-.gap-facts{margin-top:6px}
-.gap-fact{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:11px}
-.gap-pts{font-family:var(--mono);font-size:11px;font-weight:700;min-width:40px}
-/* STOCK SUMMARY */
-.verdict-banner{padding:10px 14px;border-radius:4px;font-family:var(--mono);
-  font-size:14px;font-weight:700;margin-bottom:10px}
-.verdict-buy{background:var(--grd);color:var(--gr);border:1px solid #00d68f44}
-.verdict-sell{background:var(--red);color:var(--re);border:1px solid #ff475740}
-.verdict-hold{background:var(--yed);color:var(--ye);border:1px solid #ffd32a30}
-.reason-list{margin-bottom:10px}
-.reason-item{display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:11px;
-  border-bottom:1px solid #13161e}
+/* ── SECTOR HEATMAP ── */
+.sec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.sec-cell{background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:12px}
+.sec-name{font-size:12px;font-weight:600;color:var(--mu);margin-bottom:8px;
+  text-transform:uppercase;letter-spacing:.04em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sec-bars{display:flex;gap:3px;height:46px;align-items:flex-end;margin-bottom:6px}
+.sec-bar{border-radius:3px 3px 0 0;flex:0 0 16px;min-height:2px}
+.sec-counts{display:flex;gap:8px;font-family:var(--mono);font-size:12px;font-weight:600}
+/* ── DETAIL CARDS ── */
+.det-card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--rad);
+  margin-bottom:14px;overflow:hidden;box-shadow:var(--sh)}
+.det-hdr{padding:16px 20px;border-bottom:1px solid var(--bd);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  background:linear-gradient(180deg,rgba(63,216,255,.05),transparent),var(--s2)}
+.det-sym{font-family:var(--mono);font-size:21px;font-weight:700;letter-spacing:.02em}
+.det-meta{font-size:13.5px;color:var(--mu);margin-top:2px}
+.det-body{padding:18px 20px}
+/* ── TF BLOCKS ── */
+.tf-block{border:1px solid var(--bd);border-radius:8px;margin-bottom:10px;overflow:hidden}
+.tf-block-hdr{padding:10px 14px;background:var(--s2);display:flex;align-items:center;gap:12px;
+  flex-wrap:wrap;border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:14px;font-weight:700}
+.tf-block-body{padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:12px}
+.tf-kv{font-size:13.5px}
+.tf-kv-lbl{color:var(--mu);font-size:11.5px;margin-bottom:2px;
+  text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.tf-kv-val{font-family:var(--mono);font-size:13.5px}
+/* ── REASONS ── */
+.reason{font-size:13px;color:#a7b0c8;font-style:italic;padding:4px 0 9px;
+  border-bottom:1px solid rgba(255,255,255,.055);margin-bottom:10px}
+/* ── TARGETS ── */
+.tgt-row{display:flex;gap:10px;flex-wrap:wrap;padding:10px 0;
+  border-top:1px solid rgba(255,255,255,.06);margin-top:8px}
+.tgt-box{background:var(--s2);border:1px solid var(--bd);border-radius:6px;
+  padding:8px 12px;font-family:var(--mono);font-size:13.5px}
+.tgt-lbl{font-size:11px;color:var(--mu);display:block;margin-bottom:2px;
+  text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+.tgt-context{font-size:12.5px;color:var(--mu);margin:3px 0 4px}
+/* ── CONDITIONAL ENTRY SETUPS ── */
+.report-note{background:var(--bld);border:1px solid rgba(63,216,255,.25);
+  border-radius:8px;padding:12px 15px;margin-bottom:18px;color:var(--tx);font-size:13px}
+.entry-plans{padding:14px;border-top:1px solid var(--bd);background:rgba(63,216,255,.025)}
+.entry-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 12px;margin-bottom:10px}
+.entry-heading strong{font-size:14px;color:var(--bl)}
+.entry-time{font-size:12px;color:var(--mu)}
+.entry-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:10px}
+.entry-option{min-width:0;background:var(--s2);border:1px solid var(--bd);border-radius:7px;padding:10px 12px}
+.entry-option-title{font-size:13px;font-weight:700;color:var(--tx)}
+.entry-level{font:700 17px var(--mono);color:var(--ye);margin:5px 0}
+.entry-level span{font:400 12px var(--sans);color:var(--mu);margin-left:5px}
+.entry-condition{font-size:13px;color:var(--tx);overflow-wrap:anywhere}
+.entry-note{font-size:12.5px;color:var(--mu);margin-top:10px}
+/* ── GAP PREDICTION ── */
+.gap-bar-wrap{background:rgba(255,255,255,.07);border-radius:5px;height:10px;overflow:hidden;flex:1}
+.gap-bar-fill{height:10px;border-radius:5px}
+.gap-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.gap-context{font-size:12.5px;color:var(--mu);margin-bottom:10px}
+.gap-score{font-family:var(--mono);font-size:30px;font-weight:700;min-width:62px;line-height:1}
+.gap-bias{font-family:var(--mono);font-size:16px;font-weight:700}
+.gap-facts{margin-top:8px}
+.gap-fact{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:13.5px}
+.gap-pts{font-family:var(--mono);font-size:13.5px;font-weight:700;min-width:48px}
+/* ── STOCK SUMMARY ── */
+.verdict-banner{padding:12px 16px;border-radius:8px;font-family:var(--mono);
+  font-size:17px;font-weight:700;margin-bottom:12px;border:1px solid transparent}
+.verdict-buy{background:var(--grd);color:var(--gr);border-color:rgba(37,230,160,.35)}
+.verdict-sell{background:var(--red);color:var(--re);border-color:rgba(255,92,114,.35)}
+.verdict-hold{background:var(--yed);color:var(--ye);border-color:rgba(255,203,61,.3)}
+.reason-list{margin-bottom:12px}
+.reason-item{display:flex;align-items:flex-start;gap:10px;padding:6px 0;font-size:13.5px;
+  border-bottom:1px solid rgba(255,255,255,.055)}
 .reason-item:last-child{border-bottom:none}
-.reason-icon{font-size:12px;flex-shrink:0;margin-top:1px}
-/* CANDLE CHIPS */
-.chip{display:inline-block;background:var(--s2);border:1px solid var(--bd);border-radius:3px;
-  font-family:var(--mono);font-size:9px;padding:2px 5px;margin:2px;color:var(--bl)}
-/* CONFLUENCE */
-.conf-str{font-family:var(--mono);font-size:11px;font-weight:700}
-/* NAV */
-.nav{position:fixed;top:52px;right:16px;background:var(--s1);border:1px solid var(--bd);
-  border-radius:6px;padding:10px;max-height:80vh;overflow-y:auto;font-size:10px;width:140px;
-  z-index:99}
-.nav-title{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--mu);margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--bd)}
-.nav a{display:block;padding:3px 0;color:var(--mu);font-family:var(--mono);font-size:9px}
+.reason-icon{font-size:14px;flex-shrink:0;margin-top:1px}
+/* ── CHIPS ── */
+.chip{display:inline-block;background:var(--s2);border:1px solid var(--bd);border-radius:5px;
+  font-family:var(--mono);font-size:11.5px;padding:3px 8px;margin:2px 4px 2px 0;color:var(--bl)}
+/* ── CONFLUENCE ── */
+.conf-str{font-family:var(--mono);font-size:13.5px;font-weight:700}
+/* ── SIDE NAV ── */
+.nav{position:fixed;top:66px;right:18px;background:rgba(18,23,36,.95);
+  border:1px solid var(--bd);backdrop-filter:blur(8px);
+  border-radius:var(--rad);padding:14px;max-height:80vh;overflow-y:auto;
+  font-size:12px;width:162px;z-index:99;box-shadow:var(--sh)}
+.nav-title{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--mu);margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--bd);font-weight:700}
+.nav a{display:block;padding:4px 0;color:var(--mu);font-family:var(--mono);font-size:12px}
 .nav a:hover,.nav a.bo{color:var(--gr)}.nav a.bd{color:var(--re)}.nav a.sw{color:var(--ye)}
-/* FOOTER */
-.ftr{border-top:1px solid var(--bd);padding:12px 20px;font-family:var(--mono);
-  font-size:9px;color:var(--mu);display:flex;justify-content:space-between}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.g2,.g3{grid-template-columns:1fr}.nav{display:none}.tf-block-body{grid-template-columns:1fr 1fr}}
-@media(max-width:500px){.cards{grid-template-columns:1fr}}
+/* ── FOOTER ── */
+.ftr{border-top:1px solid var(--bd);padding:14px 26px;font-family:var(--mono);
+  font-size:12px;color:var(--mu);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+/* ── RESPONSIVE ── */
+@media(max-width:1760px){.nav{display:none}}
+@media(max-width:1000px){.g2,.g3{grid-template-columns:minmax(0,1fr)}.wrap{padding:16px 14px 8px}
+  .hdr{padding:12px 14px}.ftr{padding:12px 14px}}
+@media(max-width:640px){.cards{grid-template-columns:1fr}.card-val{font-size:30px}
+  .det-sym{font-size:18px}.gap-score{font-size:26px}}
+@media print{
+  .nav{display:none}.hdr{position:static;backdrop-filter:none}
+  body{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .card,.sec,.det-card{break-inside:avoid;box-shadow:none}
+}
 </style>
 </head>
 <body>
@@ -5838,9 +6072,9 @@ tr:last-child td{border-bottom:none}
 
     # ── SIDE NAV ─────────────────────────────────────────────
     w('<div class="nav"><div class="nav-title">Symbols</div>')
-    for sym, e in ranked:
-        sig = as_dict(e.get("DAY")).get("signal", "NONE")
-        w('<a href="#sym-' + esc(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
+    for sym, e in detail_ranked:
+        sig = as_dict(e.get(report_tf(e))).get("signal", "NONE")
+        w('<a href="#' + symbol_fragment(sym) + '" class="' + sc(sig) + '">' + esc(sym) + '</a>')
     w('</div>')
 
     w('<div class="wrap">')
@@ -5852,6 +6086,7 @@ tr:last-child td{border-bottom:none}
     w('<div class="card ye"><div class="card-lbl">All-TF Breakout</div><div class="card-val">' + str(len(all_bo_syms)) + '</div><div class="card-sub">' + ', '.join(tfs) + ' aligned</div></div>')
     w('<div class="card bl"><div class="card-lbl">All-TF Breakdown</div><div class="card-val">' + str(len(all_bd_syms)) + '</div><div class="card-sub">' + (', '.join(esc(s) for s in all_bd_syms[:3]) or 'None') + '</div></div>')
     w('</div>')
+    w('<p class="report-note"><strong>Snapshot, not a trade:</strong> Reference prices and R:R use the latest stored candle close, which may be unfinished. Conditional entries below are not monitored live or guaranteed fills.</p>')
 
     # ── SECTOR HEATMAP + BEST SETUPS ─────────────────────────
     w('<div class="g2">')
@@ -5880,13 +6115,15 @@ tr:last-child td{border-bottom:none}
     # All-TF Breakout table
     w('<div class="sec"><div class="sec-title">All-TF Breakout Setups <span>' + '+'.join(tfs) + '</span></div>')
     w('<div style="overflow-x:auto"><table><thead><tr>')
-    for h in ["Symbol","Score","Price","RSI","RVol","R:R","Candle"]:
+    for h in ["Symbol","Metric TF","Score","Price","RSI","RVol","Ref R:R","Candle"]:
         w('<th>' + h + '</th>')
     w('</tr></thead><tbody>')
     allbo_data = [(sym, data[sym]) for sym in all_bo_syms if sym in data]
-    allbo_data.sort(key=lambda x: safe(as_dict(x[1].get("DAY")).get("composite_score", 0)), reverse=True)
+    allbo_data.sort(key=lambda x: safe(as_dict(x[1].get(report_tf(x[1])))
+                                       .get("composite_score", 0)), reverse=True)
     for sym, e in allbo_data:
-        de = as_dict(e.get("DAY"))
+        metric_tf = report_tf(e)
+        de = as_dict(e.get(metric_tf))
         cs = int(safe(de.get("composite_score",0)))
         sc_col = "var(--gr)" if cs >= 65 else ("var(--ye)" if cs >= 40 else "var(--re)")
         rsi = safe(de.get("rsi",0))
@@ -5896,7 +6133,11 @@ tr:last-child td{border-bottom:none}
         rsi_cls = "rsi-ob" if rsi>70 else ("rsi-bull" if rsi>55 else ("rsi-mid" if rsi>40 else "rsi-os"))
         rr_col = "var(--gr)" if rr>=1 else ("var(--ye)" if rr>=0.5 else "var(--re)")
         chips = "".join('<span class="chip">' + esc(p) + '</span>' for p in cps) if cps else '<span class="mu">—</span>'
-        w('<tr><td><a href="#sym-' + esc(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
+        w('<tr><td><a href="#' + symbol_fragment(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
+        w('<td class="mono">' + esc(metric_tf) + '</td>')
+        if not has_price(de):
+            w('<td colspan="6" class="mu">Reference data unavailable</td></tr>')
+            continue
         w('<td><div class="sbar-num" style="color:' + sc_col + '">' + str(cs) + '</div><div class="sbar-wrap"><div class="sbar-bg"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></div></td>')
         w('<td class="mono">' + fmt_p(de.get("price",0)) + '</td>')
         w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
@@ -5910,8 +6151,8 @@ tr:last-child td{border-bottom:none}
     # ── DASHBOARD TABLE ──────────────────────────────────────
     w('<div class="sec"><div class="sec-title">All Symbols — DAY Timeframe <span>Sorted by Composite Score</span></div>')
     w('<div style="overflow-x:auto"><table><thead><tr>')
-    for h in ["Symbol","Signal"] + [tf[:4] for tf in tfs] + ["Score","Price","RSI","RVol","R:R","EMA","Candle"]:
-        w('<th>' + h + '</th>')
+    for h in ["Symbol","Signal"] + list(tfs) + ["Score","Price","RSI","RVol","Ref R:R","EMA","Candle"]:
+        w('<th>' + esc(h) + '</th>')
     w('</tr></thead><tbody>')
     for sym, e in ranked:
         de  = as_dict(e.get("DAY"))
@@ -5928,7 +6169,7 @@ tr:last-child td{border-bottom:none}
         rv_col = "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")
         ema_col = "var(--gr)" if "FULL BULL" in ema else ("var(--re)" if "FULL BEAR" in ema else ("var(--gr)" if "BULL" in ema else ("var(--re)" if "BEAR" in ema else "var(--mu)")))
         chips = "".join('<span class="chip">' + esc(p) + '</span>' for p in cps)
-        w('<tr><td><a href="#sym-' + esc(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
+        w('<tr><td><a href="#' + symbol_fragment(sym) + '"><span class="sym">' + esc(sym) + '</span></a><span class="sec-tag">' + esc(SECTOR_MAP.get(sym,"")) + '</span></td>')
         w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(str(sig),"--") + '</span></td>')
         for tf in tfs:
             s2 = as_dict(e.get(tf)).get("signal","NONE")
@@ -5938,27 +6179,30 @@ tr:last-child td{border-bottom:none}
         w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
         w('<td class="mono" style="color:' + rv_col + '">' + str(rv) + '×</td>')
         w('<td class="mono" style="color:' + rr_col + '">' + str(rr) + ':1</td>')
-        w('<td style="font-size:10px;color:' + ema_col + '">' + esc(ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR")) + '</td>')
+        w('<td style="font-size:12px;color:' + ema_col + '">' + esc(ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR")) + '</td>')
         w('<td>' + chips + '</td></tr>')
     w('</tbody></table></div></div>')
 
     # ── PER-SYMBOL DETAIL CARDS ───────────────────────────────
-    w('<h2 style="font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:20px 0 10px">Symbol Detail Cards</h2>')
+    w('<h2 style="font-family:var(--sans);font-size:18px;font-weight:700;color:var(--tx);letter-spacing:0;text-transform:none;margin:28px 0 14px">Symbol Detail Cards</h2>')
 
-    for sym, e in ranked:
+    for sym, e in detail_ranked:
         sec     = SECTOR_MAP.get(sym,"")
         conf    = confluence_score(e, tfs)
         conf_lbl_map = {3:"STRONG BULL",2:"BULL",1:"WEAK BULL",0:"NEUTRAL",-1:"WEAK BEAR",-2:"BEAR"}
         conf_str = conf_lbl_map.get(conf, ("STRONG BULL" if conf>3 else "STRONG BEAR"))
         conf_col = "var(--gr)" if conf>=2 else ("var(--re)" if conf<=-2 else "var(--ye)")
-        day_e   = as_dict(e.get("DAY"))
-        price   = safe(day_e.get("price",0))
+        primary_tf = report_tf(e)
+        primary = as_dict(e.get(primary_tf))
+        price = safe(primary.get("price", 0))
+        price_desc = (fmt_p(price) + ' · ' + esc(primary_tf) + ' candle close'
+                      if has_price(primary) else 'Reference price unavailable')
 
         w('<div class="det-card" id="sym-' + esc(sym) + '">')
         w('<div class="det-hdr">')
         w('  <div>')
-        w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:13px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
-        w('    <div class="det-meta">' + fmt_p(price) + ' &nbsp;·&nbsp; Confluence: <span style="color:' + conf_col + ';font-weight:700">' + conf_str + ' (' + ('+' if conf>=0 else '') + str(conf) + ')</span></div>')
+        w('    <div class="det-sym">' + esc(sym) + ' <span style="font-size:15px;color:var(--mu);font-weight:400">[' + esc(sec) + ']</span></div>')
+        w('    <div class="det-meta">' + price_desc + ' &nbsp;·&nbsp; Confluence: <span style="color:' + conf_col + ';font-weight:700">' + conf_str + ' (' + ('+' if conf>=0 else '') + str(conf) + ')</span></div>')
         w('  </div>')
         w('  <div class="tfdots">')
         for tf in list(TF_CONFIG.keys()):
@@ -5971,7 +6215,7 @@ tr:last-child td{border-bottom:none}
 
         # Signal snapshot strip
         tf_order = [tf for tf in list(TF_CONFIG.keys()) if tf in e]
-        w('<div style="margin-bottom:14px">')
+        w('<div class="table-scroll" role="region" aria-label="Signal snapshot for ' + esc(sym) + '" tabindex="0" style="margin-bottom:14px">')
         w('<table style="width:100%"><thead><tr>')
         for h in ["TF","Signal","Score","RSI","RVol","Price","Date"]:
             w('<th>' + h + '</th>')
@@ -5986,23 +6230,25 @@ tr:last-child td{border-bottom:none}
             pr  = safe(te.get("price",0))
             cd  = te.get("candle_date","—")
             chg = te.get("signal_changed",False)
-            chg_tag = ' <span style="color:var(--ye);font-size:9px">⚡CHANGED</span>' if chg else ""
+            chg_tag = ' <span style="color:var(--ye);font-size:11px">⚡CHANGED</span>' if chg else ""
             rsi_cls = "rsi-ob" if rsi>70 else ("rsi-bull" if rsi>55 else ("rsi-mid" if rsi>40 else "rsi-os"))
             rv_col = "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")
             w('<tr><td class="mono" style="font-weight:700">' + tf + '</td>')
             w('<td><span class="badge ' + sc(sig) + '">' + SIGNAL_SHORT.get(str(sig),"--") + '</span>' + chg_tag + '</td>')
-            w('<td><div style="color:' + sc_col + ';font-family:var(--mono);font-size:11px">' + str(cs) + '</div><div class="sbar-bg" style="width:45px;margin-top:2px"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></td>')
+            w('<td><div style="color:' + sc_col + ';font-family:var(--mono);font-size:13px">' + str(cs) + '</div><div class="sbar-bg" style="width:45px;margin-top:2px"><div class="sbar-fill" style="width:' + str(cs) + '%;background:' + sc_col + '"></div></div></td>')
             w('<td><span class="rsi-p ' + rsi_cls + '">' + str(rsi) + '</span></td>')
             w('<td class="mono" style="color:' + rv_col + '">' + str(rv) + '×</td>')
-            w('<td class="mono">' + fmt_p(pr) + '</td>')
-            w('<td style="font-size:10px;color:var(--mu)">' + esc(cd) + '</td></tr>')
+            w('<td class="mono">' + (fmt_p(pr) if has_price(te) else '—') + '</td>')
+            w('<td style="font-size:12px;color:var(--mu)">' + esc(cd) + '</td></tr>')
         w('</tbody></table></div>')
 
         # Per-TF detail blocks
         for tf in tf_order:
             te  = as_dict(e[tf])
             sig = te.get("signal","NONE")
-            if sig == "NONE": continue
+            # A scanned but directionless timeframe should explain why no
+            # conditions are available; omit only empty placeholders.
+            if sig == "NONE" and not has_price(te): continue
             atr   = safe(te.get("atr",0))
             atrp  = safe(te.get("atr_pct",0))
             cs    = int(safe(te.get("composite_score",0)))
@@ -6030,11 +6276,12 @@ tr:last-child td{border-bottom:none}
             sc_col  = "var(--gr)" if cs>=65 else ("var(--ye)" if cs>=40 else "var(--re)")
 
             w('<div class="tf-block"><div class="tf-block-hdr">')
-            w('<span style="color:var(--mu);font-size:9px;font-weight:400">──</span>')
+            w('<span style="color:var(--mu);font-size:11px;font-weight:400">──</span>')
             w('<span style="color:var(--ye)">' + tf + '</span>')
             w('<span class="badge ' + sc(sig) + '">' + esc(str(sig)) + '</span>')
-            w('<span style="color:' + sc_col + ';font-size:11px">' + str(cs) + '/100</span>')
-            w('<span style="color:var(--mu);font-size:10px;font-weight:400;margin-left:auto">R:R <span style="color:' + ("var(--gr)" if rr>=1 else "var(--ye)") + '">' + str(rr) + ':1</span></span>')
+            w('<span style="color:' + sc_col + ';font-size:13px">' + str(cs) + '/100</span>')
+            rr_text = str(rr) + ':1' if has_price(te) else '—'
+            w('<span style="color:var(--mu);font-size:12px;font-weight:400;margin-left:auto">Ref R:R <span style="color:' + ("var(--gr)" if rr>=1 and has_price(te) else "var(--ye)") + '">' + rr_text + '</span></span>')
             w('</div>')
             if reason:
                 w('<div class="reason" style="padding:4px 12px">' + esc(reason.replace("|"," · ")) + '</div>')
@@ -6043,41 +6290,66 @@ tr:last-child td{border-bottom:none}
                 ("ATR", "₹"+str(round(atr,2))+" ("+str(atrp)+"%)", "var(--tx)"),
                 ("RSI(14)", str(rsi), "var(--gr)" if rsi>65 else ("var(--re)" if rsi<35 else "var(--ye)")),
                 ("Rel Vol", str(rv)+"×", "var(--gr)" if rv>=1.5 else ("var(--ye)" if rv>=1 else "var(--mu)")),
-                ("EMA Align", esc(ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR")), ema_col),
+                ("EMA Align", ema.replace("FULL BULL STACK","FULL BULL").replace("FULL BEAR STACK","FULL BEAR"), ema_col),
                 ("SuperTrend", st_txt, st_col),
                 ("MACD Cross", mc if mc else "—", mc_col),
                 ("Trend Str", str(int(ts)), ts_col),
                 ("Comp Score", str(cs)+"/100", sc_col),
             ]:
-                w('<div class="tf-kv"><div class="tf-kv-lbl">' + lbl + '</div><div class="tf-kv-val" style="color:' + col + '">' + str(val) + '</div></div>')
+                w('<div class="tf-kv"><div class="tf-kv-lbl">' + lbl + '</div><div class="tf-kv-val" style="color:' + col + '">' + esc(val) + '</div></div>')
             w('</div>')
 
             # S/R + targets
             if supp or res or tgt:
                 w('<div style="padding:8px 12px;border-top:1px solid var(--bd)">')
-                if supp: w('<div style="font-size:11px;margin-bottom:4px">Support: ' + '&nbsp;'.join('<span class="mono gr">₹'+esc(str(s))+'</span>' for s in supp) + '</div>')
-                if res:  w('<div style="font-size:11px;margin-bottom:4px">Resistance: ' + '&nbsp;'.join('<span class="mono re">₹'+esc(str(r))+'</span>' for r in res) + '</div>')
+                if supp: w('<div style="font-size:13px;margin-bottom:4px">Support: ' + '&nbsp;'.join('<span class="mono gr">₹'+esc(str(s))+'</span>' for s in supp) + '</div>')
+                if res:  w('<div style="font-size:13px;margin-bottom:4px">Resistance: ' + '&nbsp;'.join('<span class="mono re">₹'+esc(str(r))+'</span>' for r in res) + '</div>')
                 if tgt:
                     t1 = tgt.get("target1",""); t2 = tgt.get("target2",""); sl = tgt.get("stop","")
                     w('<div class="tgt-row">')
-                    w('<div class="tgt-box"><span class="tgt-lbl">Entry</span><span class="mono">' + fmt_p(pr) + '</span></div>')
-                    if t1: w('<div class="tgt-box"><span class="tgt-lbl">Target 1</span><span class="mono gr">' + fmt_p(t1) + '</span></div>')
-                    if t2: w('<div class="tgt-box"><span class="tgt-lbl">Target 2</span><span class="mono gr">' + fmt_p(t2) + '</span></div>')
-                    if sl: w('<div class="tgt-box"><span class="tgt-lbl">Stop Loss</span><span class="mono re">' + fmt_p(sl) + '</span></div>')
+                    w('<div class="tgt-box"><span class="tgt-lbl">Reference price</span><span class="mono">' + (fmt_p(pr) if has_price(te) else '—') + '</span></div>')
+                    if has_price(te):
+                        if t1: w('<div class="tgt-box"><span class="tgt-lbl">Target 1</span><span class="mono gr">' + fmt_p(t1) + '</span></div>')
+                        if t2: w('<div class="tgt-box"><span class="tgt-lbl">Target 2</span><span class="mono gr">' + fmt_p(t2) + '</span></div>')
+                        if sl: w('<div class="tgt-box"><span class="tgt-lbl">Stop Loss</span><span class="mono re">' + fmt_p(sl) + '</span></div>')
                     w('</div>')
+                    if has_price(te):
+                        w('<p class="tgt-context">Reference targets, stop and R:R assume the latest stored candle close (which may be unfinished), not a conditional entry or actual fill.</p>')
+                    else:
+                        w('<p class="tgt-context">Reference price unavailable; stored targets, stop and R:R cannot be evaluated.</p>')
                 w('</div>')
+
+            # Conditional levels are frozen to this scan. They are not fills
+            # and are deliberately separate from the close-based targets above.
+            setups = get_conditional_entries(te, tf)
+            w('<section class="entry-plans" aria-label="Conditional entries for ' + esc(tf) + '">')
+            w('<div class="entry-heading"><strong>Conditional entries · ' + esc(tf) + '</strong>')
+            w('<span class="entry-time">Candle: ' + esc(te.get("candle_date") or "unavailable") +
+              ' · Scan: ' + esc(te.get("updated") or "unavailable") + ' IST</span></div>')
+            w('<div class="entry-grid">')
+            for kind in ("breakout", "pullback"):
+                setup = setups[kind]
+                w('<div class="entry-option"><div class="entry-option-title">' + esc(setup["label"]) + '</div>')
+                if setup["level"] is not None:
+                    is_resistance = ((setups["direction"] == "BULLISH") == (kind == "breakout"))
+                    source = "nearest resistance" if is_resistance else "nearest support"
+                    w('<div class="entry-level">' + fmt_p(setup["level"]) + '<span>' + source + '</span></div>')
+                else:
+                    w('<div class="entry-level">Unavailable</div>')
+                w('<div class="entry-condition">' + esc(setup["when"]) + '</div></div>')
+            w('</div><p class="entry-note">' + esc(ENTRY_CONDITION_NOTE) + '</p></section>')
 
             # Candle + Fib + 52W + divergence
             extras = []
             if cps:
                 bull_cp = [p for p in cps if p in CANDLE_BULL]
                 bear_cp = [p for p in cps if p in CANDLE_BEAR]
-                if bull_cp: extras.append('<span style="color:var(--gr);font-size:10px">Candle ↑</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bull_cp))
-                if bear_cp: extras.append('<span style="color:var(--re);font-size:10px">Candle ↓</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bear_cp))
+                if bull_cp: extras.append('<span style="color:var(--gr);font-size:12px">Candle ↑</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bull_cp))
+                if bear_cp: extras.append('<span style="color:var(--re);font-size:12px">Candle ↓</span> ' + "".join('<span class="chip">'+p+'</span>' for p in bear_cp))
             if fib:
                 sw_h = fib.get("sw_high",""); sw_l = fib.get("sw_low","")
                 f382 = fib.get("fib_38.2",""); f500 = fib.get("fib_50",""); f618 = fib.get("fib_61.8","")
-                fib_line = '<span style="font-size:10px;color:var(--mu)">Fib:</span>'
+                fib_line = '<span style="font-size:12px;color:var(--mu)">Fib:</span>'
                 for lbl,lvl in [("38.2%",f382),("50%",f500),("61.8%",f618)]:
                     if lvl:
                         # Bug fix: raw float(lvl) raised ValueError on a junk
@@ -6089,41 +6361,46 @@ tr:last-child td{border-bottom:none}
             if w52:
                 ph = safe(w52.get("pct_from_high",0)); pl = safe(w52.get("pct_from_low",0))
                 ph_col = "var(--gr)" if ph>=-5 else ("var(--ye)" if ph>=-15 else "var(--re)")
-                extras.append('<span style="font-size:10px;color:var(--mu)">52W:</span> <span class="mono" style="color:' + ph_col + '">High ₹' + esc(str(w52.get("high_52w",""))) + ' (' + str(ph) + '%)</span> <span class="mono mu">Low ₹' + esc(str(w52.get("low_52w",""))) + ' (+' + str(pl) + '%)</span>')
+                extras.append('<span style="font-size:12px;color:var(--mu)">52W:</span> <span class="mono" style="color:' + ph_col + '">High ₹' + esc(str(w52.get("high_52w",""))) + ' (' + str(ph) + '%)</span> <span class="mono mu">Low ₹' + esc(str(w52.get("low_52w",""))) + ' (+' + str(pl) + '%)</span>')
             div_items = []
             if div_.get("regular_bull"): div_items.append('<span style="color:var(--gr)">Reg.Bull▲</span>')
             if div_.get("hidden_bull"):  div_items.append('<span style="color:var(--gr)">Hid.Bull▲</span>')
             if div_.get("regular_bear"): div_items.append('<span style="color:var(--re)">Reg.Bear▼</span>')
             if div_.get("hidden_bear"):  div_items.append('<span style="color:var(--re)">Hid.Bear▼</span>')
-            if div_items: extras.append('<span style="font-size:10px;color:var(--mu)">RSI Div:</span> ' + " ".join(div_items))
-            if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT R1=₹' + esc(str(te.get("retest_bo_level",""))) + '</span>')
-            if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN S1=₹' + esc(str(te.get("retest_bd_level",""))) + '</span>')
+            if div_items: extras.append('<span style="font-size:12px;color:var(--mu)">RSI Div:</span> ' + " ".join(div_items))
+            if te.get("retest_bo"): extras.append('<span style="color:var(--gr);font-weight:700">★ RETEST BREAKOUT (scan indicator) R1=₹' + esc(str(te.get("retest_bo_level",""))) + '</span>')
+            if te.get("retest_bd"): extras.append('<span style="color:var(--re);font-weight:700">★ RETEST BREAKDOWN (scan indicator) S1=₹' + esc(str(te.get("retest_bd_level",""))) + '</span>')
 
             if extras:
                 w('<div style="padding:6px 12px;border-top:1px solid var(--bd);display:flex;flex-wrap:wrap;gap:10px">')
                 for ex in extras:
-                    w('<div style="font-size:11px">' + ex + '</div>')
+                    w('<div style="font-size:13px">' + ex + '</div>')
                 w('</div>')
             w('</div>')  # tf-block
 
         # Next-day gap prediction
-        gap_score, gap_bias, gap_facts = calc_next_day_gap_score(e)
-        gb_col = "var(--gr)" if gap_bias=="GAP_UP" else ("var(--re)" if gap_bias=="GAP_DOWN" else "var(--ye)")
-        gb_str = ("▲ GAP UP LIKELY" if gap_bias=="GAP_UP" else ("▼ GAP DOWN LIKELY" if gap_bias=="GAP_DOWN" else "— NEUTRAL / WAIT"))
-        bar_pct = gap_score
-        bar_col = "var(--gr)" if gap_score>=62 else ("var(--re)" if gap_score<=38 else "var(--ye)")
+        if not has_price(e.get("DAY")):
+            w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
+            w('<div class="gap-context">DAY data unavailable; no gap score calculated.</div></div>')
+        else:
+            gap_score, gap_bias, gap_facts = calc_next_day_gap_score(e)
+            gb_col = "var(--gr)" if gap_bias=="GAP_UP" else ("var(--re)" if gap_bias=="GAP_DOWN" else "var(--ye)")
+            gb_str = ("▲ GAP-UP BIAS" if gap_bias=="GAP_UP" else ("▼ GAP-DOWN BIAS" if gap_bias=="GAP_DOWN" else "— NEUTRAL / WAIT"))
+            bar_pct = gap_score
+            bar_col = "var(--gr)" if gap_score>=62 else ("var(--re)" if gap_score<=38 else "var(--ye)")
 
-        w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
-        w('<div class="gap-row">')
-        w('<div class="gap-score" style="color:' + gb_col + '">' + str(gap_score) + '%</div>')
-        w('<div class="gap-bar-wrap"><div class="gap-bar-fill" style="width:' + str(bar_pct) + '%;background:' + bar_col + '"></div></div>')
-        w('<div class="gap-bias" style="color:' + gb_col + '">' + gb_str + '</div>')
-        w('</div><div class="gap-facts">')
-        for lbl, pts in sorted(gap_facts, key=lambda x: -abs(x[1])):
-            fc = "var(--gr)" if pts>0 else ("var(--re)" if pts<0 else "var(--mu)")
-            sign = "+" if pts>=0 else ""
-            w('<div class="gap-fact"><span class="gap-pts" style="color:' + fc + '">' + sign + str(pts) + 'pts</span><span>' + esc(lbl) + '</span></div>')
-        w('</div></div>')
+            w('<div style="margin-top:12px"><div class="sec-title">Next Day Gap Prediction</div>')
+            w('<div class="gap-context">Gap-up bias score (0–100%), not a calibrated probability; lower scores indicate gap-down bias.</div>')
+            w('<div class="gap-row">')
+            w('<div class="gap-score" style="color:' + gb_col + '">' + str(gap_score) + '%</div>')
+            w('<div class="gap-bar-wrap"><div class="gap-bar-fill" style="width:' + str(bar_pct) + '%;background:' + bar_col + '"></div></div>')
+            w('<div class="gap-bias" style="color:' + gb_col + '">' + gb_str + '</div>')
+            w('</div><div class="gap-facts">')
+            for lbl, pts in sorted(gap_facts, key=lambda x: -abs(x[1])):
+                fc = "var(--gr)" if pts>0 else ("var(--re)" if pts<0 else "var(--mu)")
+                sign = "+" if pts>=0 else ""
+                w('<div class="gap-fact"><span class="gap-pts" style="color:' + fc + '">' + sign + str(pts) + 'pts</span><span>' + esc(lbl) + '</span></div>')
+            w('</div></div>')
 
         # Stock summary (buy/sell reasons)
         s = generate_stock_summary(sym, e, tfs)
@@ -6134,6 +6411,7 @@ tr:last-child td{border-bottom:none}
         w('  VERDICT: ' + verdict + ' &nbsp;·&nbsp; ' + s["confidence"] + ' CONFIDENCE')
         w('</div>')
         w('<div style="font-size:12px;color:var(--mu);margin-bottom:8px">' + esc(s["headline"]) + '</div>')
+        w('<div class="gap-context">' + esc(s["action"]) + '</div>')
         if s["buy_reasons"]:
             w('<div class="reason-list">')
             for r in s["buy_reasons"]:
@@ -6245,8 +6523,9 @@ def edit_note(sym, data):
 
 def calc_next_day_gap_score(sym_data):
     """
-    Score a symbol 0-100 for next-day gap-up probability using
-    end-of-day signals from the last DAY candle.
+    Compute a 0-100 heuristic gap-up bias score from end-of-day signals.
+    Higher scores suggest an upward bias and lower scores a downward bias;
+    the score is not a calibrated probability.
 
     Factors (positive = gap-up bias, negative = gap-down bias):
       Close position in day range    ±20  (top/bottom 20% of H-L)
@@ -6292,11 +6571,14 @@ def calc_next_day_gap_score(sym_data):
         elif pos >= 0.2: pts =  -8; label = "Close in lower range"
         else:            pts = -20; label = "Close near Low (bottom 20%)"
     else:
-        if   ts >= 70:  pts = 20;  label = "Close near High (strong)"
-        elif ts >= 40:  pts = 10;  label = "Close in upper range"
-        elif ts >= 0:   pts =  3;  label = "Close mid-range"
-        elif ts >= -40: pts = -8;  label = "Close in lower range"
-        else:           pts = -20; label = "Close near Low (weak)"
+        if   ts >= 70:  pts = 20
+        elif ts >= 40:  pts = 10
+        elif ts >= 0:   pts =  3
+        elif ts >= -40: pts = -8
+        else:           pts = -20
+        # Legacy rows can lack OHLC. Preserve the existing proxy weight, but
+        # do not present trend strength as a measured close position.
+        label = "Trend strength proxy (day range unavailable; trend=" + str(ts) + ")"
     raw += pts; facts.append((label, pts))
 
     # ── 2. Multi-TF signal confluence ────────────────────────
@@ -6396,13 +6678,24 @@ def calc_next_day_gap_score(sym_data):
     raw += pts; facts.append(("EMA: " + label, pts))
 
     # ── 7. 52W High proximity ─────────────────────────────────
-    w52     = as_dict(e.get("52w"))
-    pct_h   = safe_float(w52.get("pct_from_high", -50))
-    if   pct_h >= -1:  pts = 8; label = "At 52W High! (+" + str(abs(pct_h)) + "%)"
+    w52 = as_dict(e.get("52w"))
+    pct_h = safe_float(w52.get("pct_from_high"), float("nan"))
+    if not math.isfinite(pct_h):
+        # Missing/invalid data is not evidence that price is 50% below its
+        # high. Do not manufacture a bearish factor from a default value.
+        pts = 0; label = "Unavailable"
+    elif pct_h >= -1:
+        pts = 8
+        if pct_h < 0:
+            label = "Near 52W High (" + str(pct_h) + "%)"
+        elif pct_h == 0:
+            label = "At 52W High (0.0%)"
+        else:
+            label = "Above 52W High (+" + str(pct_h) + "%)"
     elif pct_h >= -3:  pts = 6; label = "Near 52W High (" + str(pct_h) + "%)"
     elif pct_h >= -8:  pts = 3; label = "Within 8% of 52W High"
     elif pct_h <= -30: pts =-3; label = "Far from 52W High (" + str(pct_h) + "%)"
-    else:               pts = 0; label = "52W High dist: " + str(pct_h) + "%"
+    else:              pts = 0; label = "52W High dist: " + str(pct_h) + "%"
     raw += pts; facts.append(("52W High: " + label, pts))
 
     # ── 8. Trend strength ─────────────────────────────────────
@@ -6429,7 +6722,8 @@ def calc_next_day_gap_score(sym_data):
 
 def next_day_gap_view(data):
     """
-    Rank all symbols by next-day gap probability using end-of-day signals.
+    Rank symbols by the heuristic gap-up bias score using end-of-day signals.
+    The score is not a calibrated probability.
     Run this AFTER market close (3:30 PM IST) for best results.
     No extra API calls needed — uses cached scan data.
     """
@@ -6468,7 +6762,7 @@ def next_day_gap_view(data):
            _ljust("SYMBOL",  12) + "  " +
            _rjust("SCORE",    6) + "  " +
            _ljust("BIAS",    10) + "  " +
-           _ljust("PROB BAR", 20) + "  " +
+           _ljust("BIAS BAR", 20) + "  " +
            _rjust("PRICE",    9) + "  " +
            _rjust("RSI",      5) + "  " +
            _rjust("RVol",     5) + "  " +
@@ -6485,7 +6779,7 @@ def next_day_gap_view(data):
         elif bias == "GAP_DOWN": bias_col = C.RED;    bias_str = "▼ GAP_DOWN"
         else:                    bias_col = C.YELLOW;  bias_str = "— NEUTRAL "
 
-        # Probability bar: green for gap-up zone, red for gap-down zone
+        # Directional bias bar: green for gap-up zone, red for gap-down zone
         bar_len  = 20
         filled   = int(safe_float(score) / 100 * bar_len)
         if   score >= 62: bar_col = C.GREEN
@@ -6558,7 +6852,7 @@ def next_day_gap_view(data):
             cprint("    • Mixed signals — wait for first 15MIN candle direction before entering", C.DIM)
         print()
 
-    cprint("  NOTE: This is a probability estimate, NOT a guarantee.", C.YELLOW)
+    cprint("  NOTE: This is a heuristic gap-up bias score, not a calibrated probability.", C.YELLOW)
     cprint("  Always confirm with live price action at open (9:15 IST).", C.DIM)
     print()
     input("  Press ENTER...")
