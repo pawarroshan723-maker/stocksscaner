@@ -34,8 +34,8 @@ MENU = [
     "W",        # watchlist
     "H",        # history
     "E",        # export
-    "Z",        # notes
-    "P",        # custom symbols
+    "Z",        # CSV export
+    "P",        # HTML export
     "~",        # switch DB
 ]
 

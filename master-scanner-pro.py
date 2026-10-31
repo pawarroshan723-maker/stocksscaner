@@ -2733,7 +2733,7 @@ def detect_signal(df, tf="DAY"):
 #  EXTRA ANALYSIS: Price Targets, S/R, Trend Strength
 # ─────────────────────────────────────────────────────────────
 
-def get_price_targets(df, signal, tf="DAY"):
+def get_price_targets(df, signal, tf="DAY", sources=None):
     """
     Price targets and stop-loss using ATR + swing S/R levels.
 
@@ -2850,8 +2850,17 @@ def get_price_targets(df, signal, tf="DAY"):
         # one session's noise. That printed "T1 ₹969.23 / T2 ₹970.02", i.e.
         # "book half at 969 and the rest at 970", which is not a ladder.
         # In both cases rebuild T2 as an ATR-scaled extension of T1.
-        if t2 - t1 < _MIN_T2_GAP_ATR * atr:
+        t2_extended = t2 - t1 < _MIN_T2_GAP_ATR * atr
+        if t2_extended:
             t2 = round(t1 + 1.5 * atr, 2)
+        if sources is not None:
+            sources.update(target1="swing" if res_tgt else "ATR fallback",
+                           target2="ATR extension" if t2_extended else ("swing" if len(res_tgt) > 1 else "ATR fallback"),
+                           stop="swing" if sup_sl else "ATR fallback")
+        if sources is not None:
+            for key, value in (("target1", t1), ("target2", t2), ("stop", sl)):
+                if value < close * 0.01:
+                    sources[key] += " (price floor)"
         return {"target1": _floor_price(t1, close),
                 "target2": _floor_price(t2, close),
                 "stop":    _floor_price(sl, close)}
@@ -2864,8 +2873,17 @@ def get_price_targets(df, signal, tf="DAY"):
         # meaningful margin. A support 3.5×ATR down (inside the 4×ATR SL cap)
         # produced "T1 ₹930 / T2 ₹940" — cover the second half at a worse
         # price than the first.
-        if t1 - t2 < _MIN_T2_GAP_ATR * atr:
+        t2_extended = t1 - t2 < _MIN_T2_GAP_ATR * atr
+        if t2_extended:
             t2 = round(t1 - 1.5 * atr, 2)
+        if sources is not None:
+            sources.update(target1="swing" if sup_tgt else "ATR fallback",
+                           target2="ATR extension" if t2_extended else ("swing" if len(sup_tgt) > 1 else "ATR fallback"),
+                           stop="swing" if res_sl else "ATR fallback")
+        if sources is not None:
+            for key, value in (("target1", t1), ("target2", t2), ("stop", sl)):
+                if value < close * 0.01:
+                    sources[key] += " (price floor)"
         return {"target1": _floor_price(t1, close),
                 "target2": _floor_price(t2, close),
                 "stop":    _floor_price(sl, close)}
@@ -3645,6 +3663,43 @@ def _stale_intraday_warnings(sym, data, use_tfs):
     return warns
 
 
+def _scan_input_issue(df, tf):
+    """Reject scans when essential signal inputs cannot be measured."""
+    if len(df) < TF_MIN_CANDLES.get(tf, 60):
+        return "insufficient data ({} candles)".format(len(df))
+    fields = ("close", "atr", "rsi", "vol", "vol_ma20", "rel_vol", "sma20",
+              "ema9", "ema21", "ema50", "ema200", "bb_upper", "bb_lower",
+              "bb_width", "macd", "macd_signal", "macd_hist", "stoch_k",
+              "stoch_d", "st_dir", "adx", "plus_di", "minus_di", "williams_r", "mfi", "cci")
+    # Rolling calculations can otherwise replace undefined values with neutral
+    # defaults. Validate the underlying window before accepting a signal.
+    window = df.tail(20)
+    for key in ("open", "high", "low", "close", "vol"):
+        if key not in window or not all(math.isfinite(safe_float(v, float("nan"))) for v in window[key]):
+            return "missing or invalid candle " + key
+    if ((window["high"] < window["low"]).any() or
+            (window["low"] <= 0).any() or (window["open"] < window["low"]).any() or
+            (window["open"] > window["high"]).any() or (window["close"] < window["low"]).any() or
+            (window["close"] > window["high"]).any() or (window["vol"] < 0).any()):
+        return "invalid candle prices or volume"
+    recent14 = window.tail(14)
+    typical = (window["high"] + window["low"] + window["close"]) / 3
+    if recent14["high"].max() <= recent14["low"].min() or (typical - typical.mean()).abs().sum() == 0:
+        return "undefined momentum indicators (flat price window)"
+    flow = typical.diff().tail(14).fillna(0).abs() * window["vol"].tail(14)
+    if flow.sum() <= 0:
+        return "undefined money flow (no directional volume)"
+    last = df.iloc[-1]
+    missing = [key for key in fields if not math.isfinite(safe_float(last.get(key), float("nan")))]
+    if missing:
+        return "missing or invalid indicators: " + ", ".join(missing)
+    if any(safe_float(last.get(k)) <= 0 for k in ("close", "atr", "vol_ma20")) or safe_float(last.get("vol")) < 0:
+        return "invalid price, ATR, or volume baseline"
+    if not math.isfinite(safe_float(df.iloc[-2].get("macd_hist"), float("nan"))) or not math.isfinite(safe_float(df.iloc[-2].get("st_dir"), float("nan"))):
+        return "missing previous candle indicators"
+    return ""
+
+
 def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
     """
     Download candles, compute indicators, detect signals, and store
@@ -3675,14 +3730,31 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
         df = fetch_candles(inst_key, unit, value, lookback, hdrs, verbose=True, tf_name=tf)
 
         if df.empty:
-            cprint("    ✗ " + tf + ": Skipping — no usable data. "
+            entry = empty_entry()
+            entry["note"] = note
+            entry["updated"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+            entry["data_quality"] = "no usable candle data; scan failed"
+            entry["reason"] = entry["data_quality"]
+            data[sym][tf] = entry
+            cprint("    ✗ " + tf + ": No usable data; signal unavailable. "
                    "Check token, instrument key, and API connectivity.", C.RED)
             continue
 
         df = calculate_indicators(df, tf)
+        quality_issue = _scan_input_issue(df, tf)
+        if quality_issue:
+            entry = empty_entry()
+            entry["note"] = note
+            entry["updated"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+            entry["reason"] = quality_issue
+            entry["data_quality"] = quality_issue
+            data[sym][tf] = entry
+            cprint("    ⚠ " + tf + ": " + quality_issue + "; signal unavailable.", C.YELLOW)
+            continue
         signal, liq, vol, oi, reason, comps, _ = detect_signal(df, tf)
         support, resistance = calc_support_resistance(df, lookback=_SR_LOOKBACK.get(tf, 30))
-        targets     = get_price_targets(df, signal, tf)
+        target_sources = {}
+        targets     = get_price_targets(df, signal, tf, sources=target_sources)
         strength    = trend_strength(comps)
 
         # ── PRO: extra analytics ──────────────────────────────
@@ -3727,7 +3799,8 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
             else:
                 candle_date = pd.Timestamp(ts_raw).strftime("%Y-%m-%d")
         except Exception:
-            candle_date = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+            # Never substitute the scan time for a missing candle timestamp.
+            candle_date = ""
 
         macd_cross = ""
         if   macd_h > 0 and p_macd_h <= 0: macd_cross = "BULL_CROSS"
@@ -3768,6 +3841,7 @@ def _scan_one_symbol(inst_key, sym, data, use_tfs, hdrs):
             "atr":               atr_val,
             "trend_strength":    strength,
             "targets":           targets,
+            "target_sources":    target_sources,
             "support":           support,
             "resistance":        resistance,
             "macd_cross":        macd_cross,
@@ -4164,6 +4238,32 @@ def dashboard(data, tfs=None):
     print()
 
 
+def _display_number(entry, key, minimum=None, maximum=None):
+    value = entry.get(key)
+    if isinstance(value, bool):
+        return "unavailable"
+    number = safe_float(value, float("nan"))
+    if (not math.isfinite(number) or (minimum is not None and number < minimum)
+            or (maximum is not None and number > maximum)):
+        return "unavailable"
+    return str(number)
+
+
+def _reference_rr(entry):
+    """Reward/risk to T1 from the stored close, never from a conditional fill."""
+    entry = as_dict(entry)
+    targets = as_dict(entry.get("targets"))
+    price, target, stop = (entry.get("price"), targets.get("target1"), targets.get("stop"))
+    if not all(_valid_reference_price(v) for v in (price, target, stop)):
+        return None
+    price, target, stop = map(float, (price, target, stop))
+    if entry.get("signal") == "BREAKOUT" and target > price > stop:
+        return round((target - price) / (price - stop), 1)
+    if entry.get("signal") == "BREAKDOWN" and target < price < stop:
+        return round((price - target) / (stop - price), 1)
+    return None
+
+
 def view_detail(sym, data):
     """
     ONE-TAP FULL DETAIL VIEW
@@ -4214,6 +4314,9 @@ def view_detail(sym, data):
     tf_order = [tf for tf in list(TF_CONFIG.keys()) if tf in sym_data]
     for tf in tf_order:
         e   = as_dict(sym_data[tf])
+        if not is_scanned_entry(e):
+            print("  " + _ljust(tf, 6) + "  unavailable — " + str(e.get("data_quality") or "not scanned"))
+            continue
         sig = e.get("signal", "NONE")
         col = signal_color(sig)
         chg = C.YELLOW + " ⚡CHANGED" + C.RESET if e.get("signal_changed") else ""
@@ -4287,6 +4390,16 @@ def view_detail(sym, data):
 
     # ══ 4. PER-TF DETAIL BLOCKS ══════════════════════════════════
     cprint("  TIMEFRAME ANALYSIS", C.WHITE, bold=True)
+    if any(str(sym_data[tf].get("signal", "NONE")) in ("BREAKOUT", "BREAKDOWN", "SIDEWAYS")
+           or (str(sym_data[tf].get("signal", "NONE")) == "NONE" and is_scanned_entry(sym_data[tf]))
+           for tf in tf_order):
+        cprint("  Rule-based score, not a probability. Levels exclude costs and slippage.", C.DIM)
+        cprint("  Entries are price-only snapshots, not monitored live or guaranteed fills.", C.DIM)
+        cprint("  Check a full candle after the scan; later scans recalculate levels.", C.DIM)
+        cprint("  Pullbacks are same-candle touches, not proof of a prior breakout.", C.DIM)
+        cprint("  RelVol compares with the rolling 20-candle average, including this candle.", C.DIM)
+        cprint("  Reference levels use the stored close (possibly unfinished), not a fill;", C.DIM)
+        cprint("  recheck the signal and recalculate targets, stop and R:R after a fill.", C.DIM)
     print()
     for tf in tf_order:
         e   = as_dict(sym_data[tf])
@@ -4295,17 +4408,51 @@ def view_detail(sym, data):
         ref_ok = _valid_reference_price(e.get("price"))
 
         print(col + C.BOLD + "  ┌── " + tf + " " + "─" * (W - 8 - len(tf)) + C.RESET)
+        if not is_scanned_entry(e):
+            print("  │  Data        : unavailable — " + str(e.get("data_quality") or "not scanned"))
+            print("  └" + "─" * (W - 4))
+            continue
         print("  │  Signal      : " + col + C.BOLD + SIGNAL_LABEL.get(str(sig), "—") + C.RESET +
               C.DIM + "  [" + str(e.get("reason") or "—") + "]" + C.RESET)
         ref_text = "₹" + str(e.get("price")) if ref_ok else "—"
+        atr_pct_text = _display_number(e, "atr_pct", 0)
         print("  │  Price/ATR   : " + ref_text +
-              "  ATR: ₹" + str(e.get("atr","—")) +
-              "  ATR%: " + str(e.get("atr_pct",0)) + "%")
-        print("  │  Volume      : [" + bar(e.get("volume",0), color=C.BLUE) + "] " +
-              str(e.get("volume",0)) + "%  RelVol: " + str(e.get("rel_vol","—")))
-        rsi_v   = safe_float(e.get("rsi", 0))
-        rsi_col = C.RED if rsi_v > 75 else C.GREEN if rsi_v > 55 else C.YELLOW if rsi_v > 40 else C.RED
-        print("  │  RSI(14)     : " + rsi_col + str(rsi_v) + C.RESET +
+              "  ATR: " + ("₹" + _display_number(e, "atr", 0) if _display_number(e, "atr", 0) != "unavailable" else "unavailable") +
+              "  ATR%: " + (atr_pct_text + "%" if atr_pct_text != "unavailable" else atr_pct_text))
+        vol_text = _display_number(e, "volume", 0, 100)
+        relvol_text = _display_number(e, "rel_vol", 0)
+        print("  │  Vol score   : " + ("[" + bar(e["volume"], color=C.BLUE) + "] " + vol_text + "/100" if vol_text != "unavailable" else "unavailable") +
+              "  RelVol: " + (relvol_text + "x" if relvol_text != "unavailable" else "unavailable"))
+        print("  │  Candle time : " + str(e.get("candle_date") or "unavailable") +
+              "  (completion/freshness unverified)")
+        print("  │  Scan time   : " + str(e.get("updated") or "unavailable") + " IST")
+        # Calendar age is not a trading-session freshness guarantee (weekends,
+        # holidays and special sessions vary), so report it without guessing.
+        try:
+            scanned_at = IST.localize(datetime.strptime(str(e.get("updated")), "%Y-%m-%d %H:%M"))
+            age = datetime.now(IST) - scanned_at
+            if age.total_seconds() < 0:
+                print("  │  Data age    : scan time is in the future; verify clock")
+            elif age.total_seconds() >= 86400:
+                print("  │  Data age    : scan is " + str(age.days) + " calendar day(s) old; verify freshness")
+        except (ValueError, TypeError, OverflowError):
+            print("  │  Data age    : unknown (invalid scan time)")
+        if tf in TF_INTRADAY_V3:
+            try:
+                candle_day = datetime.strptime(str(e.get("candle_date"))[:10], "%Y-%m-%d").date()
+                scan_day = datetime.strptime(str(e.get("updated"))[:10], "%Y-%m-%d").date()
+                gap_days = (scan_day - candle_day).days
+                if gap_days >= 3:
+                    print("  │  Data check  : candle is " + str(gap_days) +
+                          " calendar days before scan; verify freshness")
+                elif gap_days < 0:
+                    print("  │  Data check  : candle date is after scan; verify timestamps")
+            except (ValueError, TypeError):
+                pass
+        rsi_text = _display_number(e, "rsi", 0, 100)
+        rsi_v   = safe_float(e.get("rsi"), float("nan"))
+        rsi_col = C.DIM if rsi_text == "unavailable" else (C.RED if rsi_v > 75 else C.GREEN if rsi_v > 55 else C.YELLOW if rsi_v > 40 else C.RED)
+        print("  │  RSI(14)     : " + rsi_col + rsi_text + C.RESET +
               "  Trend: " + trend_bar(e.get("trend_strength", 0), 10) +
               " " + str(e.get("trend_strength", 0)))
         print("  │  EMA Align   : " + str(e.get("ema_alignment","—")))
@@ -4322,31 +4469,28 @@ def view_detail(sym, data):
         if row2:
             print("  │  " + row2)   # Bug fix: was "│ " (1 space), should be "│  " (2 spaces)
 
-        # New indicator row: ADX, Williams %R, MFI, CCI
-        adx_v = safe_float(e.get("adx",        0))
-        pdi   = safe_float(e.get("plus_di",    0))
-        mdi   = safe_float(e.get("minus_di",   0))
-        wr_v  = safe_float(e.get("williams_r", -50))
-        mfi_v = safe_float(e.get("mfi",        50))
-        cci_v = safe_float(e.get("cci",        0))
-        adx_col = C.GREEN if adx_v > 40 else (C.YELLOW if adx_v > 25 else C.DIM)
-        adx_lbl = "STRONG" if adx_v > 40 else ("TRENDING" if adx_v > 25 else "RANGING")
-        wr_col  = C.GREEN if wr_v > -30 else (C.YELLOW if wr_v > -50 else (C.RED if wr_v < -70 else C.DIM))
-        mfi_col = C.GREEN if mfi_v > 60 else (C.RED if mfi_v < 40 else C.YELLOW)
-        cci_col = C.GREEN if cci_v > 100 else (C.RED if cci_v < -100 else C.YELLOW)
-        print("  │  ADX/Momen  : " +
-              adx_col + "ADX=" + str(adx_v) + " " + adx_lbl + C.RESET +
-              "  +DI=" + str(pdi) + "/-DI=" + str(mdi) +
-              "  " + wr_col + "W%R=" + str(wr_v) + C.RESET +
-              "  " + mfi_col + "MFI=" + str(mfi_v) + C.RESET +
-              "  " + cci_col + "CCI=" + str(cci_v) + C.RESET)
+        # Do not render missing indicators as neutral or zero values.
+        adx_text = _display_number(e, "adx", 0, 100)
+        adx_v = safe_float(e.get("adx"), float("nan"))
+        adx_lbl = ("" if adx_text == "unavailable" else
+                   " STRONG" if adx_v > 40 else " TRENDING" if adx_v > 25 else
+                   " WEAK / DEVELOPING" if adx_v >= 20 else " WEAK")
+        print("  │  ADX/Momen  : ADX=" + adx_text + adx_lbl +
+              "  +DI=" + _display_number(e, "plus_di", 0, 100) +
+              "/-DI=" + _display_number(e, "minus_di", 0, 100) +
+              "  W%R=" + _display_number(e, "williams_r", -100, 0) +
+              "  MFI=" + _display_number(e, "mfi", 0, 100) +
+              "  CCI=" + _display_number(e, "cci"))
 
-        cs = safe_float(e.get("composite_score", 0))
-        rr = safe_float(e.get("risk_reward", 0))
+        cs_text = _display_number(e, "composite_score", 0, 100)
+        if sig not in ("BREAKOUT", "BREAKDOWN"):
+            cs_text = "unavailable"
+        cs = safe_float(e.get("composite_score"), 0)
+        rr = _reference_rr(e)
         sc_col = C.GREEN if cs >= 65 else (C.YELLOW if cs >= 40 else C.DIM)
-        rr_col = C.GREEN if rr >= 2  else (C.YELLOW if rr >= 1.5 else C.RED)
-        rr_text = str(rr) + ":1" if ref_ok and math.isfinite(rr) else "—"
-        print("  │  Comp.Score  : " + sc_col + str(cs) + "/100" + C.RESET +
+        rr_col = C.GREEN if rr is not None and rr >= 2 else (C.YELLOW if rr is not None and rr >= 1.5 else C.DIM)
+        rr_text = str(rr) + ":1" if rr is not None else "unavailable"
+        print("  │  Rule score  : " + sc_col + (cs_text + "/100" if cs_text != "unavailable" else cs_text) + C.RESET +
               "  Ref R:R: " + rr_col + rr_text + C.RESET)
 
         tgt = as_dict(e.get("targets"))
@@ -4355,6 +4499,13 @@ def view_detail(sym, data):
                   "T1=₹" + str(tgt.get("target1","—")) +
                   "  T2=₹" + str(tgt.get("target2","—")) + C.RESET +
                   "  " + C.RED + "SL=₹" + str(tgt.get("stop","—")) + C.RESET)
+            sources = as_dict(e.get("target_sources"))
+            if not sources:
+                print("  │  Level source: not recorded in this snapshot; rescan this TF.")
+            else:
+                print("  │  Level source: T1=" + str(sources.get("target1") or "not recorded") +
+                      "  T2=" + str(sources.get("target2") or "not recorded") +
+                      "  SL=" + str(sources.get("stop") or "not recorded"))
         elif tgt:
             print("  │  Ref levels  : unavailable without a valid reference price")
 
@@ -4373,11 +4524,6 @@ def view_detail(sym, data):
                 print("  │    " + setup["label"] + ":")
                 for line in textwrap.wrap(setup["when"], width=max(W - 9, 30)):
                     print("  │      " + line)
-            for line in textwrap.wrap(ENTRY_CONDITION_NOTE, width=max(W - 9, 30)):
-                print("  │    " + line)
-            if tgt and ref_ok:
-                print("  │    Reference levels and R:R use the latest stored candle close,")
-                print("  │    which may be unfinished; they are not entry-specific estimates.")
 
         cps = as_list(e.get("candle_patterns"))
         if cps:
@@ -4408,7 +4554,8 @@ def view_detail(sym, data):
             fib_pairs = [("38.2%", fib.get("fib_38.2","")),
                          ("50.0%", fib.get("fib_50","")),
                          ("61.8%", fib.get("fib_61.8",""))]
-            fib_line = "  │  Fib Key Lvl : "
+            print("  │  Fib levels  : retracements measured down from swing high")
+            fib_line = "  │               "
             # Bug fix: raw price/levels reached float() below — a legacy row
             # holding "junk" in either raised TypeError/ValueError and killed
             # the detail screen.  Coerce both sides first.
@@ -7912,9 +8059,9 @@ def main_menu_loop(data, tfs):
         print("  J  Gap Scanner         Today open vs yesterday close — gap up/down")
         print("  Y  Volume Profile      HVN / LVN / POC chart for any symbol + TF")
         print("  U  Auto-Schedule       Repeat scans on a timer (Ctrl+C to stop)")
-        print("  Q  Next Day Gap ★      Predict tomorrow's gap-up/down before open")
-        print("  3  Momentum Screener ★ Rank by ADX+RSI+MFI+Williams%%R momentum score")
-        print("  4  Trend Strength      ADX | +DI/-DI | Williams%%R | MFI | CCI table")
+        print("  Q  Next Day Gap ★      Estimate next-day gap bias from DAY data")
+        print("  3  Momentum Screener ★ Rank by momentum score (ADX, RSI, MFI & more)")
+        print("  4  Trend Strength      ADX | +DI/-DI | Williams %R | MFI | CCI table")
         div("─", W)
 
         print("  " + C.CYAN + C.BOLD + "── HISTORY & WATCHLIST ───────────────────────────────────────────" + C.RESET)
@@ -7927,9 +8074,9 @@ def main_menu_loop(data, tfs):
         print("  A  Add symbol          Add a custom NSE symbol & instrument key")
         print("  R  Remove symbol       Remove a custom symbol from the list")
         print("  N  Edit note           Attach a personal note to any symbol / TF")
-        print("  E  Export TXT          Save formatted report  → master_report.txt")
-        print("  Z  Export CSV          Save machine-readable data → master_export.csv")
-        print("  P  Export HTML ★       Full visual browser report → master_report.html")
+        print("  E  Export TXT          Save report → master_report_<timestamp>.txt")
+        print("  Z  Export CSV          Save data → master_export_<timestamp>.csv")
+        print("  P  Export HTML ★       Save report → master_report_<timestamp>.html")
         print("  ~  Change DB File      Switch to a different dated backup DB")
         div("─", W)
 
